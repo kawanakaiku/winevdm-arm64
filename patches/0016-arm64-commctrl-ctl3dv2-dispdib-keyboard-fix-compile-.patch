@@ -1,8 +1,8 @@
 From 0387afdf5e80daf28a3d181c93501cf6b5e2b332 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:08:13 +0900
-Subject: [PATCH 16/27] arm64: commctrl, ctl3dv2, dispdib, keyboard: fix
- compile errors
+Subject: [PATCH] arm64: commctrl, ctl3dv2, dispdib, keyboard: fix compile
+ errors
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

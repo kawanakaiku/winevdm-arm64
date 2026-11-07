@@ -1,8 +1,8 @@
 From 84f4bd468d8204a1586f51ec664940fa6ebdcabd Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:12:07 +0900
-Subject: [PATCH 17/27] arm64: user, winhlp32: 64-bit va_list for
- FormatMessage16, pointer sized index_data.offset
+Subject: [PATCH] arm64: user, winhlp32: 64-bit va_list for FormatMessage16,
+ pointer sized index_data.offset
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

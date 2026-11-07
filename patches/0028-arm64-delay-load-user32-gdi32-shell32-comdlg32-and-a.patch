@@ -1,0 +1,32 @@
+From 1e040b746e2ddd45fe20f2f158dae52f9d40899f Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:29:29 +0900
+Subject: [PATCH] arm64: delay-load user32, gdi32, shell32, comdlg32 and
+ advapi32 in otvdm too
+
+Without it user32 is loaded before set_peb_compatible_flag and otvdm
+starts a second process on every launch to apply the compatibility flags.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ otvdm/CMakeLists.txt | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/otvdm/CMakeLists.txt b/otvdm/CMakeLists.txt
+index c06cb8e3..f2ae80b2 100644
+--- a/otvdm/CMakeLists.txt
++++ b/otvdm/CMakeLists.txt
+@@ -14,8 +14,11 @@ if (MSVC)
+ endif()
+ if (WINEVDM_ARM64 AND NOT(MSVC))
+     # as the MSVC build: krnl386.exe16 lives in dll/, which winevdm.c adds with
+-    # SetDllDirectoryW before the first call into it
++    # SetDllDirectoryW before the first call into it, and user32 must not be loaded
++    # before set_peb_compatible_flag (or otvdm restarts itself to apply the flags)
+     foreach(t otvdm otvdmw)
+-        target_link_options(${t} PRIVATE -Wl,-delayload=krnl386.exe16 -Wl,-delayload=libwine.dll)
++        target_link_options(${t} PRIVATE -Wl,-delayload=krnl386.exe16 -Wl,-delayload=libwine.dll
++            -Wl,-delayload=user32.dll -Wl,-delayload=gdi32.dll -Wl,-delayload=shell32.dll
++            -Wl,-delayload=comdlg32.dll -Wl,-delayload=advapi32.dll)
+     endforeach()
+ endif()

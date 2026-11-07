@@ -1,8 +1,8 @@
 From 527e55c249bb788635f1de4dd007d47214579f5e Mon Sep 17 00:00:00 2001
 From: u <u@example.com>
 Date: Sat, 7 Nov 2026 10:03:13 +0900
-Subject: [PATCH 06/27] arm64: shell/ver/winnls/sound/winsock/rmpatch/win87em:
- fix conversions and prototypes
+Subject: [PATCH] arm64: shell/ver/winnls/sound/winsock/rmpatch/win87em: fix
+ conversions and prototypes
 
 ---
  rmpatch/instr.c   |  4 +++-

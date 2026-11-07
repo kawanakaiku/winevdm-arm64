@@ -1,7 +1,7 @@
 From 8ce2932d33387fc293fda2db2ee321f3f10558e9 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:03:34 +0900
-Subject: [PATCH 23/27] arm64: olesvr: 16-bit OLE server structures and handles
+Subject: [PATCH] arm64: olesvr: 16-bit OLE server structures and handles
 
 - OLESERVER16/OLESERVERDOC16 vtables are tables of 16:16 pointers.
 - Values the 16-bit callbacks store (LPOLEOBJECT, LPOLESERVERDOC,

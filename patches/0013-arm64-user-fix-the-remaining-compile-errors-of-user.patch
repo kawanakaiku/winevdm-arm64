@@ -1,7 +1,7 @@
 From e62efba1c20d144043ab12bcf1e7037ff796ab72 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:05:16 +0900
-Subject: [PATCH 13/27] arm64: user: fix the remaining compile errors of user
+Subject: [PATCH] arm64: user: fix the remaining compile errors of user
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

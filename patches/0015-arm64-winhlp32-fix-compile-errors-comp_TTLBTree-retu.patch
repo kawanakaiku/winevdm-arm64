@@ -1,8 +1,8 @@
 From fccbab1207f25d1869626bdf2d315b9d2f85a234 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:07:19 +0900
-Subject: [PATCH 15/27] arm64: winhlp32: fix compile errors, comp_TTLBTree
- returns int
+Subject: [PATCH] arm64: winhlp32: fix compile errors, comp_TTLBTree returns
+ int
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

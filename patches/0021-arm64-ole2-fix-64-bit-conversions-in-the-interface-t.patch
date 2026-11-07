@@ -1,8 +1,7 @@
 From 96ac73f0cf8263b187237c0d7ea9aecff73f783a Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 10:07:31 +0900
-Subject: [PATCH 21/27] arm64: ole2: fix 64-bit conversions in the interface
- thunks
+Subject: [PATCH] arm64: ole2: fix 64-bit conversions in the interface thunks
 
 - STATSTG16.pwcsName is a SEGPTR on _WIN64 (ole2 and storage ifs.h).
 - Declare map_pformatetc16_32/32_16, take a SEGPTR in map_vardesc32.

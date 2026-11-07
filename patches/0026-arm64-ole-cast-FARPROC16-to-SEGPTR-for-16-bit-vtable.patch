@@ -1,7 +1,7 @@
 From 741a359179525253227d78712c7233ec43d1ca35 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:16:51 +0900
-Subject: [PATCH 26/27] arm64: ole: cast FARPROC16 to SEGPTR for 16-bit vtable
+Subject: [PATCH] arm64: ole: cast FARPROC16 to SEGPTR for 16-bit vtable
  entries
 
 FARPROC16 is a function pointer type on i386; keep the i386 build

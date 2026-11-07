@@ -1,8 +1,8 @@
 From fb34f35009d30491ed6f9ee313c27bdf3b12bc1a Mon Sep 17 00:00:00 2001
 From: u <u@example.com>
 Date: Sat, 7 Nov 2026 10:06:53 +0900
-Subject: [PATCH 09/27] arm64: mmsystem: message16/mmsystem/playsound
- conversions, WAVEHDR16, mixer structs
+Subject: [PATCH] arm64: mmsystem: message16/mmsystem/playsound conversions,
+ WAVEHDR16, mixer structs
 
 ---
  mmsystem/message16.c | 54 ++++++++++++++++++++++++++++----------------

@@ -1,7 +1,7 @@
 From 3d70aaa6b10dc007b68feb9422be38b995917d18 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 09:57:51 +0900
-Subject: [PATCH 02/27] arm64: 16-bit structure layouts and callback types
+Subject: [PATCH] arm64: 16-bit structure layouts and callback types
 
 - 16-bit callback 'function pointer' types are SEGPTR on 64-bit hosts.
 - LPARAM16/LRESULT16 for the 32-bit LPARAM/LRESULT fields of 16-bit

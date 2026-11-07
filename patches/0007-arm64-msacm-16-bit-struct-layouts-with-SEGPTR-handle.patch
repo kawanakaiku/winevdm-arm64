@@ -1,7 +1,7 @@
 From 0a1bbe7fb638d6bdbae1a37202de64122f5a51e4 Mon Sep 17 00:00:00 2001
 From: u <u@example.com>
 Date: Sat, 7 Nov 2026 10:04:03 +0900
-Subject: [PATCH 07/27] arm64: msacm: 16-bit struct layouts with SEGPTR, handle
+Subject: [PATCH] arm64: msacm: 16-bit struct layouts with SEGPTR, handle
  conversions
 
 ---

@@ -1,8 +1,8 @@
 From 85a0184ab1d1fd0380da3d6eccd868476c060f77 Mon Sep 17 00:00:00 2001
 From: u <u@example.com>
 Date: Sat, 7 Nov 2026 12:03:38 +0900
-Subject: [PATCH 10/27] arm64: mmsystem/mci16: widen MCI parameter blocks,
- yield thunk via NATIVE_CLOSURE, 64-bit handle fixes
+Subject: [PATCH] arm64: mmsystem/mci16: widen MCI parameter blocks, yield
+ thunk via NATIVE_CLOSURE, 64-bit handle fixes
 
 ---
  mmsystem/mci16.c | 280 +++++++++++++++++++++++++++++++++++++++--------

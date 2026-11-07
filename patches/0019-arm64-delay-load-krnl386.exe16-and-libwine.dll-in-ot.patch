@@ -1,8 +1,8 @@
 From d76c9730abe7761d79745678638b842b6d195b1b Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:19:11 +0900
-Subject: [PATCH 19/27] arm64: delay-load krnl386.exe16 and libwine.dll in
- otvdm as the MSVC build does
+Subject: [PATCH] arm64: delay-load krnl386.exe16 and libwine.dll in otvdm as
+ the MSVC build does
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

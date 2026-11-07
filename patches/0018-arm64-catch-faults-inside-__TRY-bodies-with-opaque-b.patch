@@ -1,8 +1,8 @@
 From 523a860c035ae42f44d55b841eb5d2fe2e232d2d Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:17:01 +0900
-Subject: [PATCH 18/27] arm64: catch faults inside __TRY bodies with opaque
- barrier calls
+Subject: [PATCH] arm64: catch faults inside __TRY bodies with opaque barrier
+ calls
 
 clang only implements synchronous SEH on ARM64: a load or store that
 faults directly in a __try body is outside the try range, and a body

@@ -1,8 +1,8 @@
 From c33a58dbfb437baf72346c892a6496a0ccc0402a Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:06:27 +0900
-Subject: [PATCH 14/27] arm64: gdi: ABORTPROC thunk as NATIVE_CLOSURE, fix
- compile errors
+Subject: [PATCH] arm64: gdi: ABORTPROC thunk as NATIVE_CLOSURE, fix compile
+ errors
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

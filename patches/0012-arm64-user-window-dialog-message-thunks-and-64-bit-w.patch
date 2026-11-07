@@ -1,8 +1,8 @@
 From 7dcc4345ef58bb8102173865be52393d67d873e4 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:02:14 +0900
-Subject: [PATCH 12/27] arm64: user: window/dialog/message thunks and 64-bit
- window longs (WIP)
+Subject: [PATCH] arm64: user: window/dialog/message thunks and 64-bit window
+ longs (WIP)
 
 - TIMERTHUNK, DLGPROCTHUNK and the edit word break thunks use
   NATIVE_CLOSURE on aarch64.

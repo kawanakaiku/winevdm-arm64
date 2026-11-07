@@ -1,7 +1,7 @@
 From df45b200c8cdf008b8cbd487b1769c20bbd23557 Mon Sep 17 00:00:00 2001
 From: u <u@example.com>
 Date: Sat, 7 Nov 2026 10:01:30 +0900
-Subject: [PATCH 05/27] arm64: commdlg/ddeml/lzexpand/mm headers: fix pointer
+Subject: [PATCH] arm64: commdlg/ddeml/lzexpand/mm headers: fix pointer
  conversions, mmddk conflicts, critsect init
 
 ---

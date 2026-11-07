@@ -1,7 +1,7 @@
 From b1dfde3948bc1e2bfeb1dd626d3587de483cb965 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 10:07:02 +0900
-Subject: [PATCH 03/27] arm64: krnl386, vm86, libwine, otvdm build
+Subject: [PATCH] arm64: krnl386, vm86, libwine, otvdm build
 
 - relay: on ARM64 call the typed convspec relay function of the entry
   point; thunks built at run time use relay_call_from_16 as relay and

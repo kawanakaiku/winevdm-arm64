@@ -1,7 +1,7 @@
 From 0f591c7365e58e412afd20841a3130741dde0530 Mon Sep 17 00:00:00 2001
 From: u <u@example.com>
 Date: Sat, 7 Nov 2026 12:06:21 +0900
-Subject: [PATCH 11/27] arm64: msvideo: 16-bit ICCOMPRESS/ICDECOMPRESS/ICDRAW
+Subject: [PATCH] arm64: msvideo: 16-bit ICCOMPRESS/ICDECOMPRESS/ICDRAW
  layouts, NATIVE_CLOSURE driver thunks, widened lParam slots
 
 ---

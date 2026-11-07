@@ -1,8 +1,7 @@
 From 344240be685018b85e64ac7ec7233c5939614b3a Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 09:52:50 +0900
-Subject: [PATCH 01/27] arm64: build infrastructure, convspec ARM64 output,
- CONTEXT86
+Subject: [PATCH] arm64: build infrastructure, convspec ARM64 output, CONTEXT86
 
 - CMake: move the x86-only defines to the root file, use lower case
   system library names, use build-machine convspec/widl when cross

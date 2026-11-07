@@ -1,8 +1,7 @@
 From dfc5bcc7824a4b65c766b08ae98a69947b1fdb2e Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 12:11:58 +0900
-Subject: [PATCH 24/27] arm64: ole2disp: 16-bit VARIANT, SAFEARRAY and Invoke
- fixes
+Subject: [PATCH] arm64: ole2disp: 16-bit VARIANT, SAFEARRAY and Invoke fixes
 
 - Float arguments of VarUI1FromR4/VarBstrFromR4 arrive as 'long' in
   the 16-bit spec; add _conv entry points that reinterpret the bits

@@ -1,7 +1,7 @@
 From 51e326f511e87307c8d3b6d7fdde71a3a8dad216 Mon Sep 17 00:00:00 2001
 From: u <u@localhost>
 Date: Sat, 7 Nov 2026 10:07:31 +0900
-Subject: [PATCH 20/27] arm64: widl: 64-bit safe 16-bit relay output
+Subject: [PATCH] arm64: widl: 64-bit safe 16-bit relay output
 
 - 16->32 methods: pass 8-byte structures (LARGE_INTEGER, POINTL, CY)
   as two DWORDs on _WIN64 and rebuild them, matching the 'll' relay
