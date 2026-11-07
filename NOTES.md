@@ -101,6 +101,25 @@ cmake --build out/build -j16 -- -k 0   # 2 回目から
   - winhlp32 の comp_TTLBTree の戻り値。
   - OLE の 8 件 (MAP_LPCRECTL32_16 の未初期化、HGLOBALStreamImpl16_CopyTo、IMalloc16 の QueryInterface、VectorFromBstr16 など)。
 
+## Hangover での速さ (Xperia、x86 の otvdm v0.9.0 を box64 で動かす今の形との比べ)
+
+各 3 回の平均。起動は、起動の命令から盤面の色の画素が出るまで。CPU は otvdm のプロセスの utime+stime を 30 秒間測ったもの。
+
+| 項目 | ARM64 (この版) | x86 v0.9.0 (box64) |
+|---|---|---|
+| Rodent's Revenge の起動 | 2.47 秒 | 2.78 秒 |
+| Rattler Race の起動 | 2.20 秒 | 2.65 秒 |
+| Rodent の待ちの CPU | 0.5% | 0.7% |
+| Rattler のデモ中の CPU | 6.6% | 9.3% |
+| CPU だけを使う Win16 の繰り返し (約 3.9 億命令) の CPU 時間 | 3.1 秒 (約 127 MIPS) | 5.5 秒 (約 72 MIPS) |
+| 同じ繰り返しの壁時計 (起動を含む) | 4.4 秒 | 6.9 秒 |
+
+- 2 本のゲームは GDI で描くので、Wine の +fps のログ (ddraw・OpenGL・Vulkan だけ) が出ない。fps は測れていない。
+- 繰り返しの EXE は、手で組んだ最小の NE (InitTask を呼ばず、int 21h の 4Ch で終わる)。
+  - x86 の版は、この EXE の終わりで loader の lock と Win16Mutex の取り合いで止まる (上流の不具合)。ARM64 の版は終了コード 0 で終わる。
+  - そのため、終わりは「CPU の時間の増えが止まった時」で決めた。
+- DOS の .COM は、x86 の版も ARM64 の版も krnl386 の中で落ちる (低い番地への書き込み)。Hangover での元からの制限。
+
 ## 経過
 
 - 11-07:
@@ -108,3 +127,6 @@ cmake --build out/build -j16 -- -k 0   # 2 回目から
   - krnl386・vm86・libwine・otvdm のリンク。
   - user・gdi 系、mmsystem など、OLE 系を 3 つの作業者で並べて直し、全部のモジュールのリンクが通った。
   - Hangover の Wine (Xperia、Android の aarch64) で、krnl386 の起動、Rodent's Revenge と Rattler Race の起動と描画を確かめた。
+  - otvdm の user32 なども遅延の読み込みにした (互換の旗のために自分をもう一度起動していた)。
+  - v0.1.0 を Release に置いた。Hangover の Components と同じ入れ方 (NtVdm64 の登録、otvdmw.exe) でも 2 本が動いた。
+  - x86 の版との速さの比べ (上の表)。
