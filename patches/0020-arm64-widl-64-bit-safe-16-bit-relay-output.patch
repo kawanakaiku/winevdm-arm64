@@ -1,0 +1,175 @@
+From 51e326f511e87307c8d3b6d7fdde71a3a8dad216 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 10:07:31 +0900
+Subject: [PATCH 20/27] arm64: widl: 64-bit safe 16-bit relay output
+
+- 16->32 methods: pass 8-byte structures (LARGE_INTEGER, POINTL, CY)
+  as two DWORDs on _WIN64 and rebuild them, matching the 'll' relay
+  argument string.
+- Pointer results of 16-bit calls are 16:16 or 16-bit values: cast
+  through ULONG_PTR instead of converting integers to pointers.
+- Read arrays in 16-bit memory with the 16-bit element types
+  (SEGPTR for interfaces and pointers).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ widl/relay16.c | 90 +++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 64 insertions(+), 26 deletions(-)
+
+diff --git a/widl/relay16.c b/widl/relay16.c
+index 8c7e73f5..322efabe 100644
+--- a/widl/relay16.c
++++ b/widl/relay16.c
+@@ -20,6 +20,38 @@
+ static void write_type_v(FILE *h, type_t *t, int is_field, int declonly, const char *name);
+ 
+ static void get_type_size16(const type_t *type, int *size, int *is_ptr);
++
++/* hard-coded 8-byte structures passed by value */
++static const char *get_struct8_name16(const type_t *type)
++{
++    if (!strcmp(type->c_name, "LARGE_INTEGER")) return "LARGE_INTEGER";
++    if (!strcmp(type->c_name, "ULARGE_INTEGER")) return "ULARGE_INTEGER";
++    if (!strcmp(type->c_name, "POINTL")) return "POINTL";
++    if (!strcmp(type->c_name, "CY")) return "CY";
++    assert(0);
++    return NULL;
++}
++
++/* 64-bit: rebuild the 8-byte structures split by write_args1632 */
++static void write_args1632_rebuild(FILE *h, const var_list_t *args)
++{
++    const var_t *arg;
++    int any = 0;
++    if (args) LIST_FOR_EACH_ENTRY(arg, args, const var_t, entry) {
++        int size, is_ptr;
++        get_type_size16(arg->type, &size, &is_ptr);
++        if (size != 8)
++            continue;
++        if (!any)
++            fprintf(h, "#ifdef _WIN64\n");
++        any = 1;
++        fprintf(h, "    %s args16_%s;\n", get_struct8_name16(arg->type), arg->name);
++        fprintf(h, "    ((DWORD*)&args16_%s)[0] = args16_%s_lo__;\n", arg->name, arg->name);
++        fprintf(h, "    ((DWORD*)&args16_%s)[1] = args16_%s_hi__;\n", arg->name, arg->name);
++    }
++    if (any)
++        fprintf(h, "#endif\n");
++}
+ static void write_args1632(FILE *h, const var_list_t *args, const char *name, int method)
+ {
+     const var_t *arg;
+@@ -66,27 +98,16 @@ static void write_args1632(FILE *h, const var_list_t *args, const char *name, in
+         else if (size == 8)
+         {
+             assert(!is_ptr);
+-            /* hard-coded */
+-            if (!strcmp(arg->type->c_name, "LARGE_INTEGER"))
+-            {
+-                fprintf(h, "LARGE_INTEGER args16_%s", arg->name);
+-            }
+-            else if (!strcmp(arg->type->c_name, "ULARGE_INTEGER"))
+-            {
+-                fprintf(h, "ULARGE_INTEGER args16_%s", arg->name);
+-            }
+-            else if (!strcmp(arg->type->c_name, "POINTL"))
+-            {
+-                fprintf(h, "POINTL args16_%s", arg->name);
+-            }
+-            else if (!strcmp(arg->type->c_name, "CY"))
+-            {
+-                fprintf(h, "CY args16_%s", arg->name);
+-            }
+-            else
+-            {
+-                assert(0);
+-            }
++            /* The 16-bit relay passes an 8-byte structure as two 32-bit
++             * arguments ("ll").  On x86 they form the structure on the
++             * stack; on 64-bit each one arrives in its own register, so
++             * take two DWORDs and rebuild the structure in the body
++             * (see write_args1632_rebuild). */
++            fprintf(h, "\n#ifdef _WIN64\n");
++            fprintf(h, "DWORD args16_%s_lo__, DWORD args16_%s_hi__", arg->name, arg->name);
++            fprintf(h, "\n#else\n");
++            fprintf(h, "%s args16_%s", get_struct8_name16(arg->type), arg->name);
++            fprintf(h, "\n#endif\n");
+         }
+         else
+         {
+@@ -313,7 +334,7 @@ static void write_type_conv1632(FILE *h, type_t *t, const char *expr_prefix, con
+             if (type_conv_map == TYPE_CONV_MAP_ARRAY)
+             {
+                 fprintf(h, "    %s%s = ((", to, to2);
+-                write_type_decl_left(h, t);
++                write_type_decl_left3216(h, t);
+                 fprintf(h, "*)(%s%s))[i__];\n", expr_prefix, expr);
+             }
+             else
+@@ -329,7 +350,7 @@ static void write_type_conv1632(FILE *h, type_t *t, const char *expr_prefix, con
+             return;
+         if (type_conv_map == TYPE_CONV_MAP_ARRAY)
+         {
+-            fprintf(h, "    %s%s = iface16_32(&IID_%s, ((void**)%s%s)[i__]);\n", to, to2, typ2->name, expr_prefix, expr);
++            fprintf(h, "    %s%s = iface16_32(&IID_%s, ((SEGPTR*)%s%s)[i__]);\n", to, to2, typ2->name, expr_prefix, expr);
+         }
+         else
+         {
+@@ -350,7 +371,7 @@ static void write_type_conv1632(FILE *h, type_t *t, const char *expr_prefix, con
+     {
+         fprintf(h, "16_32(%s%s, ", to, to2);
+         fprintf(h, "(((");
+-        write_type_decl_left(h, t);
++        write_type_decl_left3216(h, t);
+         fprintf(h, "*)%s%s)[i__]))", expr_prefix, expr);
+     }
+     else
+@@ -1343,6 +1364,8 @@ static void write_32_16_func(FILE *header, const statement_t *stmt, const type_t
+             fprintf(header, "result__ = (");
+             write_type_decl_left3216(header, ret_type);
+             fprintf(header, ")");
++            if (type_get_type(ret_type) == TYPE_POINTER)
++                fprintf(header, "(ULONG_PTR)");
+         }
+         fprintf(header, "%s16_%s(iface16", name, get_name(func));
+         write_args_conv(header, type_get_function_args(func->type), name, ARGS_CONV_CALL, FALSE);
+@@ -1380,6 +1403,7 @@ static void write_16_32_func(FILE *header, const statement_t *stmt, const type_t
+     }
+     fprintf(header, ")\n");
+     fprintf(header, "{\n");
++    write_args1632_rebuild(header, type_get_function_args(func->type));
+     fprintf(header, "    %s *iface32 = (%s*)get_interface32(This);\n", name, name);
+     if (type_get_type(ret_type) != TYPE_VOID)
+     {
+@@ -1414,7 +1438,14 @@ static void write_16_32_func(FILE *header, const statement_t *stmt, const type_t
+     }
+     write_args_conv(header, type_get_function_args(func->type), name, ARGS_CONV_UNMAP, TRUE);
+     write_args_conv(header, type_get_function_args(func->type), name, ARGS_CONV_AFTER_CONV, TRUE);
+-    if (type_get_type(ret_type) != TYPE_VOID)
++    if (type_get_type(ret_type) == TYPE_POINTER)
++    {
++        /* the 16-bit relay only takes the low 32 bits (DX:AX) */
++        fprintf(header, "    return (");
++        write_type_decl_left(header, ret_type);
++        fprintf(header, ")(ULONG_PTR)result16__;\n");
++    }
++    else if (type_get_type(ret_type) != TYPE_VOID)
+     {
+         fprintf(header, "    return result16__;\n");
+     }
+@@ -2178,7 +2209,14 @@ static void write_method_macro16(FILE *header, const type_t *iface, const type_t
+ 
+             fprintf(header, "    DWORD res;\n");
+             fprintf(header, "    WOWCallback16Ex(GET_SEGPTR_METHOD_ADDR(%s16, This, %s), WCB16_PASCAL, %d, args, &res);\n", name, get_vtbl_entry_name(iface, func), args_size * 2);
+-            if (type_get_type(type_function_get_rettype(func->type)) != TYPE_VOID)
++            if (type_get_type(type_function_get_rettype(func->type)) == TYPE_POINTER)
++            {
++                /* a 16:16 or 16-bit value, not a 32-bit pointer */
++                fprintf(header, "    return (");
++                write_type_decl_left(header, type_function_get_rettype(func->type));
++                fprintf(header, ")(ULONG_PTR)res;\n");
++            }
++            else if (type_get_type(type_function_get_rettype(func->type)) != TYPE_VOID)
+             {
+                 fprintf(header, "    return res;\n");
+             }

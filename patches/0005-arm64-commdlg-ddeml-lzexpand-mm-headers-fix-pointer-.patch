@@ -1,0 +1,325 @@
+From df45b200c8cdf008b8cbd487b1769c20bbd23557 Mon Sep 17 00:00:00 2001
+From: u <u@example.com>
+Date: Sat, 7 Nov 2026 10:01:30 +0900
+Subject: [PATCH 05/27] arm64: commdlg/ddeml/lzexpand/mm headers: fix pointer
+ conversions, mmddk conflicts, critsect init
+
+---
+ commdlg/filedlg.c        |  4 ++--
+ commdlg/finddlg.c        | 10 +++++-----
+ commdlg/printdlg.c       |  8 +++++---
+ ddeml/ddeml.c            |  8 ++++++--
+ lzexpand/wine_lzexpand.c |  4 ++--
+ mmsystem/driver.c        | 10 ++++++++++
+ mmsystem/mci16.c         |  6 +++++-
+ mmsystem/mmio16.c        |  6 +++++-
+ mmsystem/mmsystem.c      |  6 +++++-
+ mmsystem/playsound.c     |  6 +++++-
+ mmsystem/winemm16.h      | 10 ++++++++++
+ msacm/wineacm16.h        | 10 ++++++++++
+ msvideo/msvideo16.c      | 16 +++++++++++++++-
+ 13 files changed, 85 insertions(+), 19 deletions(-)
+
+diff --git a/commdlg/filedlg.c b/commdlg/filedlg.c
+index 8a6d083e..da183747 100644
+--- a/commdlg/filedlg.c
++++ b/commdlg/filedlg.c
+@@ -312,7 +312,7 @@ BOOL16 WINAPI GetOpenFileName16( SEGPTR ofn ) /* [in/out] address of structure w
+     OPENFILENAMEA ofn32;
+     BOOL ret;
+     DWORD count;
+-    WORD res = NULL;
++    WORD res = 0;
+ 
+     if (!lpofn) return FALSE;
+     OPENFILENAME16 ofn16 = *lpofn;
+@@ -407,7 +407,7 @@ BOOL16 WINAPI GetSaveFileName16( SEGPTR ofn ) /* [in/out] address of structure w
+     OPENFILENAMEA ofn32;
+     BOOL ret;
+     DWORD count;
+-    WORD res = NULL;
++    WORD res = 0;
+ 
+     if (!lpofn) return FALSE;
+     OPENFILENAME16 ofn16 = *lpofn;
+diff --git a/commdlg/finddlg.c b/commdlg/finddlg.c
+index 5dc9cd0e..e47d7d16 100644
+--- a/commdlg/finddlg.c
++++ b/commdlg/finddlg.c
+@@ -100,7 +100,7 @@ static INT_PTR CALLBACK find_text_dlgproc(HWND hWnd, UINT wMsg, WPARAM wParam, L
+          * FindNext (IDOK) button.  Only after typing some text, the button should be
+          * enabled.
+          */
+-        SetDlgItemTextA(hWnd, edt1, lpfr->lpstrFindWhat);
++        SetDlgItemTextA(hWnd, edt1, MapSL(lpfr->lpstrFindWhat));
+         CheckRadioButton(hWnd, rad1, rad2, (lpFlags & FR_DOWN) ? rad2 : rad1);
+         if (lpFlags & (FR_HIDEUPDOWN | FR_NOUPDOWN)) {
+             EnableWindow(GetDlgItem(hWnd, rad1), FALSE);
+@@ -162,7 +162,7 @@ HWND16 WINAPI FindText16( SEGPTR find )
+             template = resource_to_dialog32(fr16->hInstance, MapSL(fr16->lpTemplateName), NULL);
+         else
+             template = handle_to_dialog32(fr16->hInstance, NULL);
+-        ret = HWND_16(CreateDialogIndirectParamA(fr16->hInstance, template,
++        ret = HWND_16(CreateDialogIndirectParamA(NULL /* FIXME ARM64: was the 16-bit hInstance */, template,
+                                 HWND_32(fr16->hwndOwner), find_text_dlgproc, find));
+         HeapFree(GetProcessHeap(), 0, template);
+     }
+@@ -282,8 +282,8 @@ static INT_PTR CALLBACK replace_text_dlgproc(HWND hWnd, UINT wMsg, WPARAM wParam
+          * Replace / ReplaceAll buttons.  Only after typing some text, the buttons should be
+          * enabled.
+          */
+-        SetDlgItemTextA(hWnd, edt1, lpfr->lpstrFindWhat);
+-        SetDlgItemTextA(hWnd, edt2, lpfr->lpstrReplaceWith);
++        SetDlgItemTextA(hWnd, edt1, MapSL(lpfr->lpstrFindWhat));
++        SetDlgItemTextA(hWnd, edt2, MapSL(lpfr->lpstrReplaceWith));
+         CheckDlgButton(hWnd, chx1, (lpFlags & FR_WHOLEWORD) ? 1 : 0);
+         if (lpFlags & (FR_HIDEWHOLEWORD | FR_NOWHOLEWORD))
+             EnableWindow(GetDlgItem(hWnd, chx1), FALSE);
+@@ -337,7 +337,7 @@ HWND16 WINAPI ReplaceText16( SEGPTR find )
+             template = resource_to_dialog32(fr16->hInstance, MapSL(fr16->lpTemplateName), NULL);
+         else
+             template = handle_to_dialog32(fr16->hInstance, NULL);
+-        ret = HWND_16(CreateDialogIndirectParamA(fr16->hInstance, template,
++        ret = HWND_16(CreateDialogIndirectParamA(NULL /* FIXME ARM64: was the 16-bit hInstance */, template,
+                                 HWND_32(fr16->hwndOwner), replace_text_dlgproc, find));
+         HeapFree(GetProcessHeap(), 0, template);
+     }
+diff --git a/commdlg/printdlg.c b/commdlg/printdlg.c
+index 85c56419..1bcfff28 100644
+--- a/commdlg/printdlg.c
++++ b/commdlg/printdlg.c
+@@ -164,7 +164,8 @@ LPDLGTEMPLATEA resource_to_dialog32(HINSTANCE16 hInst, LPCSTR name, WORD *res)
+     if (!res)
+         FreeResource16(handle);
+     else
+-        res = ptr16;
++        /* FIXME ARM64: upstream assigns the local pointer (no effect); keep that */
++        (void)ptr16;
+     return r;
+ }
+ 
+@@ -172,11 +173,12 @@ LPDLGTEMPLATEA handle_to_dialog32(HGLOBAL16 hg, WORD *res)
+ {
+     DWORD size2;
+     SEGPTR ptr16 = WOWGlobalLock16(hg);
+-    LPDLGTEMPLATEA r = dialog_template16_to_template32(NULL, ptr16, &size2, NULL);
++    LPDLGTEMPLATEA r = dialog_template16_to_template32(0, ptr16, &size2, NULL);
+     if (!res)
+         WOWGlobalUnlock16(hg);
+     else
+-        res = ptr16;
++        /* FIXME ARM64: upstream assigns the local pointer (no effect); keep that */
++        (void)ptr16;
+     return r;
+ }
+ 
+diff --git a/ddeml/ddeml.c b/ddeml/ddeml.c
+index 192b8c95..3f7dccdd 100644
+--- a/ddeml/ddeml.c
++++ b/ddeml/ddeml.c
+@@ -173,7 +173,11 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &ddeml_cs,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": ddeml_cs") }
++#ifdef _WIN64
++        0, 0, { 0 } /* Spare is a DWORD on 64-bit */
++#else
++        0, 0, { (DWORD_PTR)(__FILE__ ": ddeml_cs") }
++#endif
+ };
+ static CRITICAL_SECTION ddeml_cs = { &critsect_debug, -1, 0, 0, 0, 0 };
+ 
+@@ -417,7 +421,7 @@ HSZ WINAPI DdeCreateStringHandle16(DWORD idInst, LPCSTR str, INT16 codepage)
+         else
+         {
+             ERR("Invalid codepage %x\n", codepage);
+-            return DMLERR_INVALIDPARAMETER;
++            return (HSZ)(ULONG_PTR)DMLERR_INVALIDPARAMETER;
+         }
+     }
+     if (str && !stricmp(str, "Progman"))
+diff --git a/lzexpand/wine_lzexpand.c b/lzexpand/wine_lzexpand.c
+index 4da44f7c..9f2f00f2 100644
+--- a/lzexpand/wine_lzexpand.c
++++ b/lzexpand/wine_lzexpand.c
+@@ -572,8 +572,8 @@ void WINAPI LZClose( HFILE fd )
+         {
+             HeapFree( GetProcessHeap(), 0, lzs->get );
+             lzstates[fd - LZ_MIN_HANDLE] = NULL;
+-            if (DeleteDosFileHandle(lzs->realfd))
+-                CloseHandle(lzs->realfd);
++            if (DeleteDosFileHandle(LongToHandle(lzs->realfd)))
++                CloseHandle(LongToHandle(lzs->realfd));
+             HeapFree( GetProcessHeap(), 0, lzs );
+         }
+ }
+diff --git a/mmsystem/driver.c b/mmsystem/driver.c
+index 7d1340cf..2b2acd37 100644
+--- a/mmsystem/driver.c
++++ b/mmsystem/driver.c
+@@ -51,7 +51,17 @@
+ #include "winuser.h"
+ #include "wownt32.h"
+ //#include "mmddk.h"
++/* ARM64: mingw mciapi.h declares these with different types than wine mmddk.h */
++#ifdef __aarch64__
++#include <mmsystem.h>
++#define mciDriverNotify mciDriverNotify_wine32
++#define mciLoadCommandResource mciLoadCommandResource_wine32
++#endif
+ #include "wine/mmsystem16.h"
++#ifdef __aarch64__
++#undef mciDriverNotify
++#undef mciLoadCommandResource
++#endif
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(driver);
+diff --git a/mmsystem/mci16.c b/mmsystem/mci16.c
+index a8097fb6..66ac6f26 100644
+--- a/mmsystem/mci16.c
++++ b/mmsystem/mci16.c
+@@ -783,7 +783,11 @@ static CRITICAL_SECTION_DEBUG mci_critsect_debug =
+ {
+     0, 0, &mci_cs,
+     { &mci_critsect_debug.ProcessLocksList, &mci_critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_mci_cs") }
++#ifdef _WIN64
++        0, 0, { 0 } /* Spare is a DWORD on 64-bit */
++#else
++        0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_mci_cs") }
++#endif
+ };
+ static CRITICAL_SECTION mci_cs = { &mci_critsect_debug, -1, 0, 0, 0, 0 };
+ 
+diff --git a/mmsystem/mmio16.c b/mmsystem/mmio16.c
+index cbec02dd..79266913 100644
+--- a/mmsystem/mmio16.c
++++ b/mmsystem/mmio16.c
+@@ -83,7 +83,11 @@ static CRITICAL_SECTION_DEBUG mmio_critsect_debug =
+ {
+     0, 0, &mmio_cs,
+     { &mmio_critsect_debug.ProcessLocksList, &mmio_critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_mmio_cs") }
++#ifdef _WIN64
++        0, 0, { 0 } /* Spare is a DWORD on 64-bit */
++#else
++        0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_mmio_cs") }
++#endif
+ };
+ static CRITICAL_SECTION mmio_cs = { &mmio_critsect_debug, -1, 0, 0, 0, 0 };
+ 
+diff --git a/mmsystem/mmsystem.c b/mmsystem/mmsystem.c
+index 0c540c9a..afcc8041 100644
+--- a/mmsystem/mmsystem.c
++++ b/mmsystem/mmsystem.c
+@@ -71,7 +71,11 @@ static CRITICAL_SECTION_DEBUG mmdrv_critsect_debug =
+ {
+     0, 0, &mmdrv_cs,
+     { &mmdrv_critsect_debug.ProcessLocksList, &mmdrv_critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_mmdrv_cs") }
++#ifdef _WIN64
++        0, 0, { 0 } /* Spare is a DWORD on 64-bit */
++#else
++        0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_mmdrv_cs") }
++#endif
+ };
+ CRITICAL_SECTION mmdrv_cs = { &mmdrv_critsect_debug, -1, 0, 0, 0, 0 };
+ 
+diff --git a/mmsystem/playsound.c b/mmsystem/playsound.c
+index 7eb12dda..4ad80224 100644
+--- a/mmsystem/playsound.c
++++ b/mmsystem/playsound.c
+@@ -47,7 +47,11 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &WINMM_cs,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_playsound_cs") }
++#ifdef _WIN64
++        0, 0, { 0 } /* Spare is a DWORD on 64-bit */
++#else
++        0, 0, { (DWORD_PTR)(__FILE__ ": mmsystem_playsound_cs") }
++#endif
+ };
+ 
+ static CRITICAL_SECTION WINMM_cs = { &critsect_debug, -1, 0, 0, 0, 0 };
+diff --git a/mmsystem/winemm16.h b/mmsystem/winemm16.h
+index 2ea0cc5d..2b2f4acb 100644
+--- a/mmsystem/winemm16.h
++++ b/mmsystem/winemm16.h
+@@ -19,7 +19,17 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/* ARM64: mingw mciapi.h declares these with different types than wine mmddk.h */
++#ifdef __aarch64__
++#include <mmsystem.h>
++#define mciDriverNotify mciDriverNotify_wine32
++#define mciLoadCommandResource mciLoadCommandResource_wine32
++#endif
+ #include "wine/mmsystem16.h"
++#ifdef __aarch64__
++#undef mciDriverNotify
++#undef mciLoadCommandResource
++#endif
+ #include "wownt32.h"
+ 
+ /* mmsystem (16 bit files) only functions */
+diff --git a/msacm/wineacm16.h b/msacm/wineacm16.h
+index 41b8171d..4d1bc612 100644
+--- a/msacm/wineacm16.h
++++ b/msacm/wineacm16.h
+@@ -20,7 +20,17 @@
+ #define __WINE_WINEACM16_H
+ 
+ #include "wine/windef16.h"
++/* ARM64: mingw mciapi.h declares these with different types than wine mmddk.h */
++#ifdef __aarch64__
++#include <mmsystem.h>
++#define mciDriverNotify mciDriverNotify_wine32
++#define mciLoadCommandResource mciLoadCommandResource_wine32
++#endif
+ #include "wine/mmsystem16.h"
++#ifdef __aarch64__
++#undef mciDriverNotify
++#undef mciLoadCommandResource
++#endif
+ 
+ /***********************************************************************
+  * Win16 definitions
+diff --git a/msvideo/msvideo16.c b/msvideo/msvideo16.c
+index b37f6f76..e51b615a 100644
+--- a/msvideo/msvideo16.c
++++ b/msvideo/msvideo16.c
+@@ -35,7 +35,17 @@
+ #include "wownt32.h"
+ #include "vfw16.h"
+ #include "wine/debug.h"
++/* ARM64: mingw mciapi.h declares these with different types than wine mmddk.h */
++#ifdef __aarch64__
++#include <mmsystem.h>
++#define mciDriverNotify mciDriverNotify_wine32
++#define mciLoadCommandResource mciLoadCommandResource_wine32
++#endif
+ #include "wine/mmsystem16.h"
++#ifdef __aarch64__
++#undef mciDriverNotify
++#undef mciLoadCommandResource
++#endif
+ 
+ #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+ 
+@@ -1067,7 +1077,11 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &msvideo_cs,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": msvideo_cs") }
++#ifdef _WIN64
++        0, 0, { 0 } /* Spare is a DWORD on 64-bit */
++#else
++        0, 0, { (DWORD_PTR)(__FILE__ ": msvideo_cs") }
++#endif
+ };
+ static CRITICAL_SECTION msvideo_cs = { &critsect_debug, -1, 0, 0, 0, 0 };
+ 

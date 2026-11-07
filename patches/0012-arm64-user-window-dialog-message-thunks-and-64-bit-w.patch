@@ -1,0 +1,1514 @@
+From 7dcc4345ef58bb8102173865be52393d67d873e4 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:02:14 +0900
+Subject: [PATCH 12/27] arm64: user: window/dialog/message thunks and 64-bit
+ window longs (WIP)
+
+- TIMERTHUNK, DLGPROCTHUNK and the edit word break thunks use
+  NATIVE_CLOSURE on aarch64.
+- WINPROC_THUNK (16-bit code) pushes the winproc handle on 64-bit;
+  the real window procedure is kept in thunk_procs.
+- 16-bit DWL_* offsets (DWL_*16) are distinct from DWLP_* on 64-bit.
+- Pointer sized window/class values use the *Ptr functions.
+- Dialog item creation data holds a 4-byte SEGPTR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ user/dialog.c       |  79 ++++++++++-------
+ user/hook.c         |   4 +
+ user/message.c      | 201 +++++++++++++++++++++++++++++---------------
+ user/user_private.h |   6 ++
+ user/window.c       | 176 +++++++++++++++++++++++++-------------
+ 5 files changed, 311 insertions(+), 155 deletions(-)
+
+diff --git a/user/dialog.c b/user/dialog.c
+index 7cdbd906..dd964a6b 100644
+--- a/user/dialog.c
++++ b/user/dialog.c
+@@ -22,6 +22,7 @@
+ #include "wine/port.h"
+ 
+ #include <stdarg.h>
++#include <stdio.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -35,6 +36,16 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(dialog);
+ BOOL is_reactos();
+ 
++#ifdef __aarch64__
++#include "wine/native_thunk.h"
++typedef struct
++{
++    NATIVE_CLOSURE closure; /* calls DlgProc_Thunk(this, ...) */
++    BOOL used;
++    HWND hDlg;
++    LPVOID param;
++} DLGPROCTHUNK;
++#else
+ #include <pshpack1.h>
+ typedef struct
+ {
+@@ -49,6 +60,7 @@ typedef struct
+     LPVOID param;
+ } DLGPROCTHUNK;
+ #include <poppack.h>
++#endif
+ void free_proc_thunk(DLGPROCTHUNK *thunk);
+ BYTE get_aflags(HMODULE16 hModule);
+ 
+@@ -281,7 +293,7 @@ LRESULT CALLBACK DlgProcCall16(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lParam
+ 			HMENU hMenu;
+ 			if (cs->hMenu)
+ 			{
+-				BOOL ret = SetMenu(hDlg, HMENU_32(cs->hMenu));
++				BOOL ret = SetMenu(hDlg, HMENU_32((HMENU16)(ULONG_PTR)cs->hMenu));
+ 			}
+ 			ATOM classatom = GetClassLongA(hDlg, GCW_ATOM);//WNDPROC16
+ 			HWND16 hWnd16 = HWND_16(hDlg);
+@@ -289,14 +301,14 @@ LRESULT CALLBACK DlgProcCall16(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lParam
+ 			{
+ 				if (params[1])
+ 				{
+-					SetDlgProc16(hWnd16, params[1]);
++					SetDlgProc16(hWnd16, (DWORD)params[1]);
+ 				}
+ 				else
+ 				{
+                     SetDlgProc16(hWnd16, WNDCLASS16Info[classatom].wndproc);
+ 				}
+ 			}
+-			cs->lpCreateParams = params[0];
++			cs->lpCreateParams = (LPVOID)params[0];
+ 			free(cs);
+ 		}
+ 		break;
+@@ -327,17 +339,17 @@ LRESULT call_window_proc16(HWND16 hwnd, UINT16 msg, WPARAM16 wParam, LPARAM lPar
+ LRESULT call_dialog_proc16(HWND16 hwnd, UINT16 msg, WPARAM16 wParam, LPARAM lParam,
+     LRESULT *result, void *arg)
+ {
+-    SetWindowLong16(hwnd, DWL_MSGRESULT, 0xdeadbeef);
++    SetWindowLong16(hwnd, DWL_MSGRESULT16, 0xdeadbeef);
+     call_window_proc16(hwnd, msg, wParam, lParam, result, arg);
+     *result &= 0xffff;
+     LRESULT r = *result;/* result: 16-bit */
+-    if (GetWindowLong16(hwnd, DWL_MSGRESULT) == 0xdeadbeef)
++    if (GetWindowLong16(hwnd, DWL_MSGRESULT16) == 0xdeadbeef)
+     {
+         return r;
+     }
+     else
+     {
+-        *result = GetWindowLong16(hwnd, DWL_MSGRESULT);
++        *result = GetWindowLong16(hwnd, DWL_MSGRESULT16);
+     }
+     return r;
+ }
+@@ -354,7 +366,7 @@ INT_PTR CALLBACK DlgProc_Thunk(DLGPROCTHUNK *thunk_data, HWND hDlg, UINT Msg, WP
+         }
+         HWND16 hWnd16 = HWND_16(hDlg);
+         SetDlgProc16(hWnd16, cs->dlgProc);
+-        SetWindowLongPtrA(hDlg, DWLP_DLGPROC, DlgProc);
++        SetWindowLongPtrA(hDlg, DWLP_DLGPROC, (LONG_PTR)DlgProc);
+         HeapFree(GetProcessHeap(), 0, cs);
+         free_proc_thunk(thunk_data);
+     }
+@@ -378,9 +390,9 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lParam)
+         default:
+         {
+             INT_PTR result = WINPROC_CallProc32ATo16(call_dialog_proc16, msg.hwnd, msg.message, msg.wParam, msg.lParam,
+-                &ret, wndproc16);
+-            if (GetWindowLong16(HWND_16(msg.hwnd), DWL_MSGRESULT) != 0xdeadbeef)
+-                SetWindowLongA(hDlg, DWL_MSGRESULT, ret);
++                &ret, (void *)(ULONG_PTR)wndproc16);
++            if (GetWindowLong16(HWND_16(msg.hwnd), DWL_MSGRESULT16) != 0xdeadbeef)
++                SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, ret);
+             else
+                 return ret;
+             return result;
+@@ -395,15 +407,15 @@ LRESULT WINAPI DIALOG_CallDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
+ {
+     LRESULT ret;
+     BOOL16 result = WINPROC_CallProc32ATo16(call_dialog_proc16, hwnd, msg, wParam, lParam,
+-        &ret, proc);
+-    if (GetWindowLong16(HWND_16(hwnd), DWL_MSGRESULT) != 0xdeadbeef)
+-        SetWindowLongA(hwnd, DWL_MSGRESULT, ret);
++        &ret, (void *)(ULONG_PTR)proc);
++    if (GetWindowLong16(HWND_16(hwnd), DWL_MSGRESULT16) != 0xdeadbeef)
++        SetWindowLongPtrA(hwnd, DWLP_MSGRESULT, ret);
+     return result;
+ }
+ 
+ void paddingDWORD(DWORD **d)
+ {
+-	*d = (BYTE*)(((DWORD)*d + 3) & ~((DWORD)3));
++	*d = (BYTE*)(((ULONG_PTR)*d + 3) & ~((ULONG_PTR)3));
+ }
+ void copy_widestr(LPCSTR name, LPWSTR *templatew, DLGTEMPLATEEX **template32)
+ {
+@@ -417,7 +429,7 @@ void copy_widestr(LPCSTR name, LPWSTR *templatew, DLGTEMPLATEEX **template32)
+ 			*template32 = HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, *template32, HeapSize(GetProcessHeap(), 0, *template32) + slen * 2);
+ 			*templatew = (char *)*template32 + off;
+ 		}
+-		len = MultiByteToWideChar(CP_ACP, NULL, name, -1, *templatew, strlen(name) * 4)
++		len = MultiByteToWideChar(CP_ACP, 0, name, -1, *templatew, strlen(name) * 4)
+ 			* 2;
+ 	}
+ 	if (len)
+@@ -441,7 +453,7 @@ static BOOL DIALOG_CreateControls16Ex(HWND hwnd, LPCSTR template,
+ 	DLG_CONTROL_INFO info;
+ 	HWND hwndCtrl, hwndDefButton = 0;
+ 	INT items = dlgTemplate->nbItems;
+-	dlgItemTemplate32 = (BYTE*) (((DWORD)dlgItemTemplate32 + 3) & ~((DWORD)3));
++	dlgItemTemplate32 = (BYTE*) (((ULONG_PTR)dlgItemTemplate32 + 3) & ~((ULONG_PTR)3));
+ 	WORD *dlgItemTemplatew;
+ 	TRACE(" BEGIN\n");
+ 	while (items--)
+@@ -464,7 +476,7 @@ static BOOL DIALOG_CreateControls16Ex(HWND hwnd, LPCSTR template,
+             char buffer[512];
+             if (((dlgItemTemplate32->style & 0xF) == SS_ICON || (dlgItemTemplate32->style & 0xF) == SS_BITMAP) && stricmp(info.className, "STATIC") == 0)
+             {
+-                sprintf(buffer, "#%d", (int)info.windowName);
++                sprintf(buffer, "#%d", (int)LOWORD(info.windowName));
+                 copy_widestr(buffer, &dlgItemTemplatew, template32);
+             }
+             else
+@@ -482,9 +494,9 @@ static BOOL DIALOG_CreateControls16Ex(HWND hwnd, LPCSTR template,
+         }
+ 		if (info.data)
+ 		{
+-			*dlgItemTemplatew++ = sizeof(info.data);
++			*dlgItemTemplatew++ = sizeof(SEGPTR);
+             /* reference to 16-bit dialog template */
+-            *((LPCVOID*)dlgItemTemplatew) = MAKESEGPTR(SELECTOROF(base16), OFFSETOF(base16) + (WORD)((SIZE_T)info.data - base32));
++            *((SEGPTR*)dlgItemTemplatew) = MAKESEGPTR(SELECTOROF(base16), OFFSETOF(base16) + (WORD)((SIZE_T)info.data - base32));
+ 			dlgItemTemplatew += 2;
+ 		}
+ 		else
+@@ -503,7 +515,7 @@ static BOOL DIALOG_DumpControls32(HWND hwnd, LPCSTR template,
+ 	DLG_CONTROL_INFO info;
+ 	HWND hwndCtrl, hwndDefButton = 0;
+ 	INT items = dlgTemplate->nbItems;
+-	dlgItemTemplate32 = (BYTE*)(((DWORD)dlgItemTemplate32 + 3) & ~((DWORD)3));
++	dlgItemTemplate32 = (BYTE*)(((ULONG_PTR)dlgItemTemplate32 + 3) & ~((ULONG_PTR)3));
+ 	WORD *dlgItemTemplatew;
+ 	TRACE(" BEGIN\n");
+ 	while (items--)
+@@ -515,7 +527,7 @@ static BOOL DIALOG_DumpControls32(HWND hwnd, LPCSTR template,
+ 		//ç≈å„ÇÃÉGÉâÅ[î‘çÜéÊìæ
+ 		DWORD dwError = GetLastError();
+ 		//ï∂éöóÒïœä∑
+-		FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, dwError, NULL, pszError, sizeof(pszError), NULL);
++		FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, dwError, 0, pszError, sizeof(pszError), NULL);
+ 		DPRINTF("id 0x%x=%s, err=%s\n", info.id, buf, pszError);
+ 	}
+ 	TRACE(" END\n");
+@@ -569,7 +581,7 @@ DLGTEMPLATEEX *WINAPI dialog_template16_to_template32(HINSTANCE16 hInst, SEGPTR
+ 	{
+ 		//WNDclass
+         template.className = win32classname(hInst, template.className);
+-		len = MultiByteToWideChar(CP_ACP, NULL, template.className, -1, (LPWSTR)templatew, (1 + strlen(template.className)) * 4)
++		len = MultiByteToWideChar(CP_ACP, 0, template.className, -1, (LPWSTR)templatew, (1 + strlen(template.className)) * 4)
+ 			* 2;
+ 		if (len)
+ 		{
+@@ -581,7 +593,7 @@ DLGTEMPLATEEX *WINAPI dialog_template16_to_template32(HINSTANCE16 hInst, SEGPTR
+ 		}
+ 	}
+ 	//dialog title
+-	len = MultiByteToWideChar(CP_ACP, NULL, template.caption, -1, (LPWSTR)templatew, (1 + strlen(template.caption)) * 4)
++	len = MultiByteToWideChar(CP_ACP, 0, template.caption, -1, (LPWSTR)templatew, (1 + strlen(template.caption)) * 4)
+ 		* 2;
+ 	if (len)
+ 	{
+@@ -596,7 +608,7 @@ DLGTEMPLATEEX *WINAPI dialog_template16_to_template32(HINSTANCE16 hInst, SEGPTR
+ 		*templatew++ = template.pointSize;
+ 		*templatew++ = template.weight;
+ 		*templatew++ = (DEFAULT_CHARSET << 8) | FALSE;
+-		len = MultiByteToWideChar(CP_ACP, NULL, template.faceName, -1, (LPWSTR)templatew, (1 + strlen(template.faceName)) * 4)
++		len = MultiByteToWideChar(CP_ACP, 0, template.faceName, -1, (LPWSTR)templatew, (1 + strlen(template.faceName)) * 4)
+ 			* 2;
+ 		if (len)
+ 		{
+@@ -663,13 +675,18 @@ static void init_proc_thunk()
+ {
+     if (thunk_array)
+         return;
++#ifdef __aarch64__
++    /* the native closures are bigger than the x86 thunks */
++    MAX_THUNK = 16384 / sizeof(DLGPROCTHUNK);
++#else
+     MAX_THUNK = 4096 / sizeof(DLGPROCTHUNK);
++#endif
+     thunk_array = VirtualAlloc(NULL, MAX_THUNK * sizeof(DLGPROCTHUNK), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+ }
+ dialog_data *get_dialog_data(HWND hWnd)
+ {
+-    DLGPROC dlgproc = GetWindowLongPtrA(hWnd, DWLP_DLGPROC);
+-    if (thunk_array <= dlgproc && thunk_array + MAX_THUNK > dlgproc)
++    void *dlgproc = (void *)GetWindowLongPtrA(hWnd, DWLP_DLGPROC);
++    if ((void *)thunk_array <= dlgproc && (void *)(thunk_array + MAX_THUNK) > dlgproc)
+     {
+         return (dialog_data*)(((DLGPROCTHUNK *)dlgproc)->param);
+     }
+@@ -677,12 +694,16 @@ dialog_data *get_dialog_data(HWND hWnd)
+ }
+ DLGPROCTHUNK *init_thunk_data(LPVOID param, int i, LPVOID func)
+ {
++#ifdef __aarch64__
++    init_native_closure(&thunk_array[i].closure, thunk_array + i, DlgProc_Thunk);
++#else
+     thunk_array[i].pop_eax = 0x58;
+     thunk_array[i].push_imm = 0x68;
+     thunk_array[i].this_ = thunk_array + i;
+     thunk_array[i].push_eax = 0x50;
+     thunk_array[i].jmp_rel = 0xE9;
+     thunk_array[i].DlgProc = (UINT_PTR)DlgProc_Thunk - (UINT_PTR)(&thunk_array[i].DlgProc + 1);
++#endif
+     thunk_array[i].used = TRUE;
+     thunk_array[i].hDlg = 0;
+     thunk_array[i].param = param;
+@@ -729,7 +750,7 @@ static HWND DIALOG_CreateIndirect16(HINSTANCE16 hInst, SEGPTR dlgTemplate16,
+     dialog_data *paramd = (dialog_data*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(dialog_data));
+     HINSTANCE hInst32 = HINSTANCE_32(hInst);
+     DWORD size;
+-    DLGTEMPLATEEX *template32 = dialog_template16_to_template32(hInst32, dlgTemplate16, &size, paramd);
++    DLGTEMPLATEEX *template32 = dialog_template16_to_template32(hInst, dlgTemplate16, &size, paramd);
+     DWORD count;
+     DLGPROC proc = allocate_proc_thunk(paramd, DlgProc_Thunk);
+     paramd->dlgProc = dlgProc;
+@@ -1011,7 +1032,7 @@ INT16 WINAPI DialogBoxParam16( HINSTANCE16 hInst, LPCSTR template,
+         HWND owner = WIN_Handle32(owner16);
+         hwnd = DIALOG_CreateIndirect16( hInst, data, owner, dlgProc, param, TRUE );
+         GlobalUnlock16( hmem );
+-        return hwnd;
++        return (INT16)(INT_PTR)hwnd;
+     }
+     FreeResource16( hmem );
+     return ret;
+@@ -1030,7 +1051,7 @@ INT16 WINAPI DialogBoxIndirectParam16( HINSTANCE16 hInst, HANDLE16 dlgTemplate,
+     if (!(ptr = WOWGlobalLock16( dlgTemplate ))) return -1;
+     hwnd = DIALOG_CreateIndirect16( hInst, ptr, owner, dlgProc, param, TRUE );
+     GlobalUnlock16( dlgTemplate );
+-    return hwnd;
++    return (INT16)(INT_PTR)hwnd;
+ }
+ 
+ 
+diff --git a/user/hook.c b/user/hook.c
+index 0fb7be9e..10c0d784 100644
+--- a/user/hook.c
++++ b/user/hook.c
+@@ -146,7 +146,11 @@ static CRITICAL_SECTION_DEBUG global_hook_section_debug =
+ {
+     0, 0, &global_hook_section,
+     { &global_hook_section_debug.ProcessLocksList, &global_hook_section_debug.ProcessLocksList },
++#ifdef _WIN64
++      0, 0, 0
++#else
+       0, 0, { (DWORD_PTR)(__FILE__ ": global hook") }
++#endif
+ };
+ static CRITICAL_SECTION global_hook_section = { &global_hook_section_debug, -1, 0, 0, 0, 0 };
+ struct list global_hook_entry[NB_HOOKS16] =
+diff --git a/user/message.c b/user/message.c
+index db7d7f6f..59a7beb4 100644
+--- a/user/message.c
++++ b/user/message.c
+@@ -74,6 +74,12 @@ ULONG WINAPI get_windows_build();
+ DWORD USER16_AlertableWait = 0;
+ static UINT aviwnd_msg = 0;
+ static void *aviwnd_cwp;
++/* sent with aviwnd_msg; cwp returns the 32-bit window proc to call (was MSG.time) */
++struct aviwnd_msg_args
++{
++    MSG msg;
++    void *cwp;
++};
+ static ATOM dialogmsgthunk;
+ 
+ struct wow_handlers32 wow_handlers32;
+@@ -203,7 +209,11 @@ typedef struct
+ {
+     BYTE        popl_eax;        /* popl  %eax (return address) */
+     BYTE        pushl_func;      /* pushl $proc */
++#ifdef _WIN64
++    DWORD       proc;            /* winproc handle; the 32-bit proc is in thunk_procs */
++#else
+     WNDPROC     proc;
++#endif
+     BYTE        pushl_eax;       /* pushl %eax */
+     BYTE        ljmp;            /* ljmp relay*/
+     DWORD       relay_offset;    /* __wine_call_wndproc */
+@@ -222,6 +232,22 @@ static unsigned int winproc16_used;
+ static WINPROC_THUNK *thunk_array;
+ static UINT thunk_selector;
+ 
++/* This 16-bit code (executed by the emulator) pushes a 32-bit value only,
++ * so on 64-bit hosts it pushes the winproc handle and the real 32-bit
++ * window procedure is kept here. */
++#ifdef _WIN64
++static WNDPROC thunk_procs[MAX_WINPROCS16];
++static inline WNDPROC get_thunk_proc( UINT index )
++{
++    return index < MAX_WINPROCS16 ? thunk_procs[index] : NULL;
++}
++#else
++static inline WNDPROC get_thunk_proc( UINT index )
++{
++    return thunk_array[index].proc;
++}
++#endif
++
+ /* return the window proc index for a given handle, or -1 for an invalid handle
+  * indices 0 .. MAX_WINPROCS32-1 are for 32-bit procs,
+  * indices MAX_WINPROCS32 .. MAX_WINPROCS32+MAX_WINPROCS16-1 for 16-bit procs */
+@@ -268,9 +294,9 @@ static WNDPROC16 alloc_win16_thunk( WNDPROC handle )
+ 
+         assert( MAX_WINPROCS16 * sizeof(WINPROC_THUNK) <= 0x10000 );
+ 
+-        if (!(thunk_selector = wine_ldt_alloc_entries(1))) return NULL;
++        if (!(thunk_selector = wine_ldt_alloc_entries(1))) return 0;
+         if (!(thunk_array = VirtualAlloc( NULL, MAX_WINPROCS16 * sizeof(WINPROC_THUNK), MEM_COMMIT,
+-                                          PAGE_EXECUTE_READWRITE ))) return NULL;
++                                          PAGE_EXECUTE_READWRITE ))) return 0;
+         wine_ldt_set_base( &entry, thunk_array );
+         wine_ldt_set_limit( &entry, MAX_WINPROCS16 * sizeof(WINPROC_THUNK) - 1 );
+         wine_ldt_set_flags( &entry, WINE_LDT_FLAGS_CODE | WINE_LDT_FLAGS_32BIT );
+@@ -281,7 +307,13 @@ static WNDPROC16 alloc_win16_thunk( WNDPROC handle )
+     thunk = &thunk_array[index];
+     thunk->popl_eax     = 0x58;   /* popl  %eax */
+     thunk->pushl_func   = 0x68;   /* pushl $proc */
++#ifdef _WIN64
++    if (index >= MAX_WINPROCS16) return 0;
++    thunk->proc         = MAKELONG( index, WINPROC_HANDLE );
++    thunk_procs[index]  = handle;
++#else
+     thunk->proc         = handle;
++#endif
+     thunk->pushl_eax    = 0x50;   /* pushl %eax */
+     thunk->ljmp         = 0xea;   /* ljmp   relay*/
+     thunk->relay_offset = OFFSETOF(relay);
+@@ -306,7 +338,7 @@ WNDPROC16 WINPROC_GetProc16( WNDPROC proc, BOOL unicode )
+     return alloc_win16_thunk( winproc );
+ #else
+     if (!proc)
+-        return NULL;
++        return 0;
+ 
+     if (proc == WindowProc16)
+         proc = DefWindowProcA;
+@@ -319,7 +351,7 @@ WNDPROC16 WINPROC_GetProc16( WNDPROC proc, BOOL unicode )
+ /*static*/ LRESULT call_window_proc16( HWND16 hwnd, UINT16 msg, WPARAM16 wParam, LPARAM lParam,
+                                    LRESULT *result, void *arg )
+ {
+-    WNDPROC16 func = arg;
++    WNDPROC16 func = (WNDPROC16)(ULONG_PTR)arg;
+     int index = winproc_to_index( func );
+     CONTEXT86 context;
+     size_t size = 0;
+@@ -395,7 +427,7 @@ WNDPROC16 WINPROC_GetProc16( WNDPROC proc, BOOL unicode )
+     WOWCallback16Ex( 0, WCB16_REGS, sizeof(args.params) + size, &args, (DWORD *)&context );
+     //restore stack
+     setWOW32Reserved(old);
+-    *result = MAKELONG( LOWORD(context.Eax), LOWORD(context.Edx) );
++    *result = (LONG)MAKELONG( LOWORD(context.Eax), LOWORD(context.Edx) );  /* 16-bit LRESULT */
+     return *result;
+ }
+ 
+@@ -427,6 +459,14 @@ static LRESULT call_dialog_proc_Ato16( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
+ 
+ #define MAX_THUNKS 32
+ 
++#ifdef __aarch64__
++#include "wine/native_thunk.h"
++static struct word_break_thunk
++{
++    NATIVE_CLOSURE      closure;        /* calls call_word_break_proc16(proc16, ...) */
++    EDITWORDBREAKPROC16 proc16;
++} *word_break_thunks;
++#else
+ #include <pshpack1.h>
+ static struct word_break_thunk
+ {
+@@ -438,6 +478,7 @@ static struct word_break_thunk
+     DWORD               callback;
+ } *word_break_thunks;
+ #include <poppack.h>
++#endif
+ 
+ /**********************************************************************
+  *           call_word_break_proc16
+@@ -474,11 +515,15 @@ static struct word_break_thunk *add_word_break_thunk( EDITWORDBREAKPROC16 proc16
+ 
+         for (thunk = word_break_thunks; thunk < &word_break_thunks[MAX_THUNKS]; thunk++)
+         {
++#ifdef __aarch64__
++            init_native_closure( &thunk->closure, NULL, call_word_break_proc16 );
++#else
+             thunk->popl_eax     = 0x58;   /* popl  %eax */
+             thunk->pushl_proc16 = 0x68;   /* pushl proc16 */
+             thunk->pushl_eax    = 0x50;   /* pushl %eax */
+             thunk->jmp          = 0xe9;   /* jmp call_word_break_proc16 */
+             thunk->callback     = (char *)call_word_break_proc16 - (char *)(&thunk->callback + 1);
++#endif
+         }
+     }
+     for (thunk = word_break_thunks; thunk < &word_break_thunks[MAX_THUNKS]; thunk++)
+@@ -488,6 +533,9 @@ static struct word_break_thunk *add_word_break_thunk( EDITWORDBREAKPROC16 proc16
+     {
+         if (thunk->proc16) continue;
+         thunk->proc16 = proc16;
++#ifdef __aarch64__
++        set_native_closure_data( &thunk->closure, (void *)(ULONG_PTR)proc16 );
++#endif
+         return thunk;
+     }
+     FIXME("Out of word break thunks\n");
+@@ -502,7 +550,7 @@ static EDITWORDBREAKPROC16 get_word_break_thunk( EDITWORDBREAKPROCA proc )
+     struct word_break_thunk *thunk = (struct word_break_thunk *)proc;
+     if (word_break_thunks && thunk >= word_break_thunks && thunk < &word_break_thunks[MAX_THUNKS])
+         return thunk->proc16;
+-    return NULL;
++    return 0;
+ }
+ 
+ 
+@@ -692,7 +740,7 @@ static HANDLE16 convert_handle_32_to_16(UINT_PTR src, unsigned int flags)
+     UINT        sz = GlobalSize((HANDLE)src);
+     LPSTR       ptr16, ptr32;
+ 
+-    if (dst = GLOBAL_FindLink(src))
++    if (dst = GLOBAL_FindLink((HGLOBAL)src))
+     {
+         if (GlobalSize16(dst) != sz)
+             dst = GlobalReAlloc16(dst, sz, 0);
+@@ -909,13 +957,13 @@ static INT LISTBOX_FindFileStrPos( HWND lbhwnd, LPCSTR str )
+     CHAR p[MAX_PATH];
+ 
+     if (!(GetWindowLongA(lbhwnd, GWL_STYLE) & LBS_HASSTRINGS))
+-        return SendMessageA(lbhwnd, LB_FINDSTRING, -1, str);
++        return SendMessageA(lbhwnd, LB_FINDSTRING, -1, (LPARAM)str);
+     min = 0;
+     max = SendMessageA(lbhwnd, LB_GETCOUNT, 0, 0);
+     while (min != max)
+     {
+         INT index = (min + max) / 2;
+-        SendMessageA(lbhwnd, LB_GETTEXT, index, p);
++        SendMessageA(lbhwnd, LB_GETTEXT, index, (LPARAM)p);
+         if (*p == '[')  /* drive or directory */
+         {
+             if (*str != '[') res = -1;
+@@ -945,7 +993,7 @@ static INT LISTBOX_FindFileStrPos( HWND lbhwnd, LPCSTR str )
+ /***********************************************************************
+  *           LISTBOX_Directory
+  */
+-static LRESULT LISTBOX_Directory( HWND lbhwnd, UINT attrib, LPCWSTR filespec )
++static LRESULT LISTBOX_Directory( HWND lbhwnd, UINT attrib, LPCSTR filespec )
+ {
+     HANDLE handle;
+     LRESULT ret = LB_OKAY;
+@@ -993,7 +1041,7 @@ static LRESULT LISTBOX_Directory( HWND lbhwnd, UINT attrib, LPCWSTR filespec )
+                 }
+                 CharLowerA( buffer );
+                 pos = LISTBOX_FindFileStrPos( lbhwnd, buffer );
+-                if ((ret = SendMessageA(lbhwnd, LB_INSERTSTRING, pos, buffer)) < 0)
++                if ((ret = SendMessageA(lbhwnd, LB_INSERTSTRING, pos, (LPARAM)buffer)) < 0)
+                     break;
+                 if (ret <= maxinsert) maxinsert++; else maxinsert = ret;
+             } while (FindNextFileA( handle, &entry ));
+@@ -1013,7 +1061,7 @@ static LRESULT LISTBOX_Directory( HWND lbhwnd, UINT attrib, LPCWSTR filespec )
+             for (drive = 0; drive < 26; drive++, buffer[2]++, root[0]++)
+             {
+                 if (GetDriveTypeA(root) <= DRIVE_NO_ROOT_DIR) continue;
+-                if ((ret = SendMessageA(lbhwnd, LB_ADDSTRING, 0, buffer)) < 0)
++                if ((ret = SendMessageA(lbhwnd, LB_ADDSTRING, 0, (LPARAM)buffer)) < 0)
+                     break;
+             }
+         }
+@@ -1150,7 +1198,7 @@ static LRESULT listbox_proc_CallProc16To32A(winproc_callback_t callback, HWND hw
+ 		* be set automatically (this is different in Win32) */
+ 		if (wParam & DDL_DRIVES) wParam |= DDL_EXCLUSIVE;
+ 		lParam = (LPARAM)MapSL(lParam);
+-        *result = LISTBOX_Directory(hwnd, wParam, lParam);
++        *result = LISTBOX_Directory(hwnd, wParam, (LPCSTR)lParam);
+         return *result;
+ 	case LB_SETTABSTOPS16:
+ 	{
+@@ -1212,7 +1260,7 @@ void DROPSTRUCT32_16(LPDROPSTRUCT lpds32, LPDROPSTRUCT16 lpds16)
+             WCHAR buf[0x1000];
+             SIZE_T read;
+             HANDLE process = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+-            if (ReadProcessMemory(process, lpds32->dwData, buf, sizeof(buf), &read) && read >= sizeof(*buf))
++            if (ReadProcessMemory(process, (LPCVOID)lpds32->dwData, buf, sizeof(buf), &read) && read >= sizeof(*buf))
+             {
+                 buf[(read / sizeof(*buf)) - 1] = 0;
+                 ERR("D&D file from other processes is broken in win32. %s\n", debugstr_w(buf));
+@@ -1343,7 +1391,7 @@ static HDROP16 hdrop32_to_hdrop16(HDROP hdrop32)
+         while (TRUE)
+         {
+             size_t len = wcslen(filenames) + 1;
+-            size16 += WideCharToMultiByte(CP_ACP, NULL, filenames, len, NULL, 0, NULL, NULL);
++            size16 += WideCharToMultiByte(CP_ACP, 0, filenames, len, NULL, 0, NULL, NULL);
+             filenames += len;
+             if (len == 1)
+                 break;
+@@ -1376,7 +1424,7 @@ static HDROP16 hdrop32_to_hdrop16(HDROP hdrop32)
+         while (TRUE)
+         {
+             size_t len = wcslen(filenames) + 1;
+-            int mblen = WideCharToMultiByte(CP_ACP, NULL, filenames, len, filenames16, remain_bytes, NULL, NULL);
++            int mblen = WideCharToMultiByte(CP_ACP, 0, filenames, len, filenames16, remain_bytes, NULL, NULL);
+             remain_bytes -= mblen;
+             filenames16 += mblen;
+             filenames += len;
+@@ -1601,7 +1649,7 @@ LRESULT WINPROC_CallProc16To32A( winproc_callback_t callback, HWND16 hwnd, UINT1
+             }
+             ret = callback( hwnd32, msg, wParam, (LPARAM)&cs, result, arg );
+             if (mdiclient || mdichild)
+-                cs.lpCreateParams = cs16->lpCreateParams;
++                cs.lpCreateParams = (LPVOID)(ULONG_PTR)cs16->lpCreateParams;
+             CREATESTRUCT32Ato16( hwnd32, &cs, cs16 );
+         }
+         break;
+@@ -1728,7 +1776,7 @@ LRESULT WINPROC_CallProc16To32A( winproc_callback_t callback, HWND16 hwnd, UINT1
+             mis.itemID     = mis16->itemID;
+             mis.itemWidth  = mis16->itemWidth;
+             mis.itemHeight = mis16->itemHeight;
+-            mis.itemData   = mis16->CtlType == ODT_MENU ? MapSL(mis16->itemData) : mis16->itemData;
++            mis.itemData   = mis16->CtlType == ODT_MENU ? (ULONG_PTR)MapSL(mis16->itemData) : mis16->itemData;
+             ret = callback( hwnd32, msg, wParam, (LPARAM)&mis, result, arg );
+             mis16->itemWidth  = (UINT16)mis.itemWidth;
+             mis16->itemHeight = (UINT16)mis.itemHeight;
+@@ -1924,11 +1972,11 @@ LRESULT WINPROC_CallProc16To32A( winproc_callback_t callback, HWND16 hwnd, UINT1
+             LONG style = GetWindowLongA(hwnd32, GWL_STYLE);
+             if ((style & (WS_SYSMENU | WS_CAPTION)) == (WS_SYSMENU | WS_CAPTION))
+             {
+-                HICON icon = SendMessageA(hwnd32, WM_GETICON, ICON_SMALL, 0);
++                HICON icon = (HICON)SendMessageA(hwnd32, WM_GETICON, ICON_SMALL, 0);
+                 if (!icon)
+                 {
+-                    icon = SendMessageA(hwnd32, WM_QUERYDRAGICON, 0, 0);
+-                    if (icon) SendMessageA(hwnd32, WM_SETICON, ICON_SMALL, icon);
++                    icon = (HICON)SendMessageA(hwnd32, WM_QUERYDRAGICON, 0, 0);
++                    if (icon) SendMessageA(hwnd32, WM_SETICON, ICON_SMALL, (LPARAM)icon);
+                 }
+             }
+         }
+@@ -2066,6 +2114,9 @@ LRESULT WINPROC_CallProc16To32A( winproc_callback_t callback, HWND16 hwnd, UINT1
+     return ret;
+ }
+ 
++NE_TYPEINFO *get_resource_table(HMODULE16 hmod, LPCSTR type, LPBYTE *restab);
++BYTE get_aflags(HMODULE16 hModule);
++
+ static HICON16 get_default_icon(HINSTANCE16 inst)
+ {
+     LPBYTE restab;
+@@ -2090,7 +2141,14 @@ static HICON16 get_default_icon(HINSTANCE16 inst)
+ 
+ #include <uxtheme.h>
+ #include <vssym32.h>
+-#include "../mmsystem/winemm16.h"
++/* only HDRVR_16 is needed; wine/mmsystem16.h (mmddk.h) conflicts with the
++ * mingw mciapi.h declarations on aarch64 */
++#ifndef HDRVR_16
++#ifndef WOW_TYPE_HANDLE
++#define WOW_TYPE_HANDLE     (WOW_TYPE_FULLHWND + 1)
++#endif
++#define HDRVR_16(h32)		WOWHandle16(h32, WOW_TYPE_HANDLE)
++#endif
+ 
+ void InitWndProc16(HWND hWnd, HWND16 hWnd16);
+ /**********************************************************************
+@@ -2139,21 +2197,21 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+         GetWindowThreadProcessId(parent, &pid);
+         if (pid == GetCurrentProcessId())
+         {
+-            MSG avimsg = { hwnd, msg, wParam, lParam };
+-            LRESULT ret = SendMessageA(parent, aviwnd_msg, NULL, &avimsg);
++            struct aviwnd_msg_args avimsg = { { hwnd, msg, wParam, lParam }, NULL };
++            LRESULT ret = SendMessageA(parent, aviwnd_msg, 0, (LPARAM)&avimsg);
+             if (msg == WM_DESTROY)
+                 window_type_table[hwnd16] = 0;
+-            if (avimsg.time)
+-                return CallWindowProcA(avimsg.time, hwnd, msg, wParam, lParam);
++            if (avimsg.cwp)
++                return CallWindowProcA((WNDPROC)avimsg.cwp, hwnd, msg, wParam, lParam);
+             return ret;
+         }
+     }
+     if (msg && (msg == aviwnd_msg))
+     {
+-        MSG *avimsg = (MSG *)lParam;
++        struct aviwnd_msg_args *avimsg = (struct aviwnd_msg_args *)lParam;
+         aviwnd_cwp = NULL;
+-        LRESULT ret = WindowProc16(avimsg->hwnd, avimsg->message, avimsg->wParam, avimsg->lParam);
+-        avimsg->time = aviwnd_cwp;
++        LRESULT ret = WindowProc16(avimsg->msg.hwnd, avimsg->msg.message, avimsg->msg.wParam, avimsg->msg.lParam);
++        avimsg->cwp = aviwnd_cwp;
+         return ret;
+     }
+             
+@@ -2253,7 +2311,7 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+         *result = (LRESULT)HMENU_32((HMENU16)*result);
+         break;
+     case WM_MDINEXT:
+-        ret = callback(HWND_16(hwnd), msg, HWND_16(wParam), lParam, result, arg);
++        ret = callback(HWND_16(hwnd), msg, HWND_16((HWND)wParam), lParam, result, arg);
+         break;
+     case WM_GETMINMAXINFO:
+         {
+@@ -2370,7 +2428,7 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+             dis.CtlID         = dis32->CtlID;
+             if ((dis32->CtlType == ODT_MENU) && (dis32->itemID > 0xffff))
+             {
+-                HMENU16 menu = HMENU_16(dis32->itemID);
++                HMENU16 menu = HMENU_16((HMENU)LongToHandle(dis32->itemID));
+                 if (menu) dis.itemID = menu;
+                 else dis.itemID = dis32->itemID;
+             }
+@@ -2397,7 +2455,7 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+             mis.CtlID      = mis32->CtlID;
+             if ((mis32->CtlType == ODT_MENU) && (mis32->itemID > 0xffff))
+             {
+-                HMENU16 menu = HMENU_16(mis32->itemID);
++                HMENU16 menu = HMENU_16((HMENU)LongToHandle(mis32->itemID));
+                 if (menu) mis.itemID = menu;
+                 else mis.itemID = mis32->itemID;
+             }
+@@ -2421,7 +2479,7 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+             cds.cbData = cds32->cbData;
+             cds.lpData = MapLS( cds32->lpData );
+             lParam = MapLS( &cds );
+-            ret = callback( HWND_16(hwnd), msg, HWND_16(wParam), lParam, result, arg );
++            ret = callback( HWND_16(hwnd), msg, HWND_16((HWND)wParam), lParam, result, arg );
+             UnMapLS( lParam );
+             UnMapLS( cds.lpData );
+         }
+@@ -2481,7 +2539,7 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+         if (krnl386_get_compat_mode("256color") && (callback == call_window_proc16) && LOWORD(wParam))
+         {
+             LRESULT res;
+-            callback(HWND_16(hwnd), WM_QUERYNEWPALETTE, NULL, NULL, &res, arg);
++            callback(HWND_16(hwnd), WM_QUERYNEWPALETTE, 0, 0, &res, arg);
+         }
+     case WM_CHARTOITEM:
+     case WM_VKEYTOITEM:
+@@ -2507,7 +2565,7 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+     case WM_CTLCOLORSTATIC:
+         ret = callback( HWND_16(hwnd), WM_CTLCOLOR, HDC_16((HDC)wParam),
+                         MAKELPARAM( HWND_16((HWND)lParam), msg - WM_CTLCOLORMSGBOX ), result, arg );
+-        *result = HBRUSH_32((HBRUSH16)*result);
++        *result = (LRESULT)HBRUSH_32((HBRUSH16)*result);
+         break;
+     case WM_MENUSELECT:
+         if(HIWORD(wParam) & MF_POPUP)
+@@ -2551,11 +2609,11 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+     case WM_PAINT:
+         // force a paint for hidden win30 windows, KB Q80898
+         if ((GetExpWinVer16(GetExePtr(GetCurrentTask())) < 0x30a) &&  !(GetWindowLongA(hwnd, GWL_STYLE) & WS_CHILD))
+-            EnumChildWindows(hwnd, child_paint, NULL);
++            EnumChildWindows(hwnd, child_paint, 0);
+         if (IsIconic( hwnd ) && GetClassLongPtrW( hwnd, GCLP_HICON ))
+             ret = callback( HWND_16(hwnd), WM_PAINTICON, 1, lParam, result, arg );
+         else
+-            ret = callback( HWND_16(hwnd), WM_PAINT, HDC_16(wParam), lParam, result, arg );
++            ret = callback( HWND_16(hwnd), WM_PAINT, HDC_16((HDC)wParam), lParam, result, arg );
+         break;
+ 	case WM_NCPAINT:
+         ret = callback(HWND_16(hwnd), WM_NCPAINT, HRGN_16((HRGN)wParam), lParam, result, arg);
+@@ -2669,13 +2727,13 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+         break;
+     case EM_GETRECT:
+     {
+-        lParam = MapLS(lParam);
++        lParam = MapLS((LPCVOID)lParam);
+         ret = callback(HWND_16(hwnd), msg + EM_GETSEL16 - EM_GETSEL, wParam, lParam, result, arg);
+         UnMapLS(lParam);
+     }
+     break;
+     case EM_GETLINE:
+-        ret = callback(HWND_16(hwnd), msg + EM_GETSEL16 - EM_GETSEL, wParam, (LPARAM)MapLS(lParam), result, arg);
++        ret = callback(HWND_16(hwnd), msg + EM_GETSEL16 - EM_GETSEL, wParam, (LPARAM)MapLS((LPCVOID)lParam), result, arg);
+         break;
+     case EM_GETSEL:
+         ret = callback(HWND_16(hwnd), msg + EM_GETSEL16 - EM_GETSEL, 0, 0, result, arg);
+@@ -2867,7 +2925,7 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+     case WM_QUERYDRAGICON:
+         ret = callback(HWND_16(hwnd), msg, wParam, lParam, result, arg);
+         if (!*result)
+-            *result = get_default_icon(GetWindowWord16(HWND_16(hwnd), GWL_HINSTANCE));
++            *result = get_default_icon(GetWindowWord16(HWND_16(hwnd), GWLP_HINSTANCE));
+         *result = (LRESULT)get_icon_32((HICON16)*result);
+         break;
+     case WM_QUERYDROPOBJECT:
+@@ -2958,9 +3016,9 @@ LRESULT WINPROC_CallProc32ATo16( winproc_callback16_t callback, HWND hwnd, UINT
+     case 0x4c8: //MCIWNDM_NOTIFYMODE
+     {
+         char clsname[12];
+-        BOOL r = GetClassNameA(wParam, &clsname, 12);
++        BOOL r = GetClassNameA((HWND)wParam, clsname, 12);
+         if (r && !stricmp(clsname, "MCIWNDCLASS"))
+-            ret = callback(HWND_16(hwnd), msg, HWND_16(wParam), lParam, result, arg);
++            ret = callback(HWND_16(hwnd), msg, HWND_16((HWND)wParam), lParam, result, arg);
+         else
+             ret = callback( HWND_16(hwnd), msg, wParam, lParam, result, arg );
+         break;
+@@ -3077,7 +3135,7 @@ static LRESULT send_message_to_same_process_callback(HWND hwnd, UINT msg, WPARAM
+     args.lp = lp;
+     ReleaseThunkLock(&count);
+     *result = 0;
+-    EnumWindows(send_message_to_same_process, &args);
++    EnumWindows(send_message_to_same_process, (LPARAM)&args);
+     RestoreThunkLock(count);
+     return *result;
+ }
+@@ -3147,7 +3205,7 @@ LRESULT WINAPI SendMessage16( HWND16 hwnd16, UINT16 msg, WPARAM16 wparam, LPARAM
+                     /* first the WH_CALLWNDPROC hook */
+                     call_WH_CALLWNDPROC_hook(hwnd16, &msg, &wparam, &lparam);
+                     CallWindowProc16(dlgproc, hwnd16, msg, wparam, lparam);
+-                    return GetWindowLong16(hwnd16, DWL_MSGRESULT);
++                    return GetWindowLong16(hwnd16, DWL_MSGRESULT16);
+                 }
+             }
+ 			WINPROC_CallProc16To32A(send_message_callback, hwnd16, msg, wparam, lparam, &result, NULL);
+@@ -3216,11 +3274,11 @@ LRESULT WINAPI CallWindowProc16( WNDPROC16 func, HWND16 hwnd, UINT16 msg,
+     if (!func) return 0;
+ 
+     if (index == -1 || index >= MAX_WINPROCS32)
+-        call_window_proc16( hwnd, msg, wParam, lParam, &result, func );
++        call_window_proc16( hwnd, msg, wParam, lParam, &result, (void *)(ULONG_PTR)func );
+     else
+     {
+         WNDPROC proc = (WNDPROC)func;
+-        if (thunk_array && thunk_array[index].proc) proc = thunk_array[index].proc;
++        if (thunk_array && get_thunk_proc(index)) proc = get_thunk_proc(index);
+         WINPROC_CallProc16To32A( call_window_proc_callback, hwnd, msg, wParam, lParam, &result, proc );
+     }
+     return result;
+@@ -3233,6 +3291,11 @@ LRESULT WINAPI CallWindowProc16( WNDPROC16 func, HWND16 hwnd, UINT16 msg,
+ LRESULT WINAPI __wine_call_wndproc( HWND16 hwnd, UINT16 msg, WPARAM16 wParam, LPARAM lParam, WNDPROC proc )
+ {
+     LRESULT result;
++#ifdef _WIN64
++    /* called by the 16-bit window proc thunks with a (sign extended) winproc handle */
++    if (HIWORD(proc) == WINPROC_HANDLE && (LONG_PTR)proc == (LONG)(ULONG_PTR)proc)
++        proc = thunk_array ? get_thunk_proc( LOWORD(proc) ) : NULL;
++#endif
+     WINPROC_CallProc16To32A( call_window_proc_callback, hwnd, msg, wParam, lParam, &result, proc );
+     return result;
+ }
+@@ -3272,7 +3335,7 @@ BOOL16 WINAPI PeekMessage32_16( MSG32_16 *msg16, HWND16 hwnd16,
+         MsgWaitForMultipleObjectsEx( 0, NULL, 0, 0, MWMO_ALERTABLE );
+     if (!PeekMessageA( &msg, hwnd, first, last, flags )) return FALSE;
+ 
+-    if ((msg.message == WM_TIMER) && (flags & PM_REMOVE) && !msg.hwnd && msg.lParam && !is_timer_thunk(msg.lParam))
++    if ((msg.message == WM_TIMER) && (flags & PM_REMOVE) && !msg.hwnd && msg.lParam && !is_timer_thunk((TIMERPROC)msg.lParam))
+     {
+         DispatchMessageA(&msg);
+         return PeekMessage32_16(msg16, hwnd16, first, last, flags, wHaveParamHigh);
+@@ -4372,7 +4435,7 @@ static LRESULT edit_proc_CallProc16To32A(winproc_callback_t callback, HWND hwnd,
+     case WM_HSCROLL:
+     case WM_VSCROLL:
+         if (LOWORD(wParam) == SB_THUMBTRACK || LOWORD(wParam) == SB_THUMBPOSITION)
+-            return callback(hwnd, msg, MAKELONG(LOWORD(wParam), LOWORD(lParam)), NULL, result, arg);
++            return callback(hwnd, msg, MAKELONG(LOWORD(wParam), LOWORD(lParam)), 0, result, arg);
+         if (LOWORD(wParam) == EM_GETTHUMB16 || LOWORD(wParam) == EM_LINESCROLL16) wParam -= msg16_offset;
+         return callback(hwnd, msg, wParam, lParam, result, arg);
+     }
+@@ -4956,7 +5019,7 @@ static void UB_Message(HWND hwnd, HDC hDC, UINT action)
+ 
+     GetClientRect(hwnd, &rc);
+ 
+-    if ((hFont = SendMessageW(hwnd, WM_GETFONT, 0, 0))) SelectObject(hDC, hFont);
++    if ((hFont = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0))) SelectObject(hDC, hFont);
+ 
+     parent = GetParent(hwnd);
+     if (!parent) parent = hwnd;
+@@ -4968,7 +5031,7 @@ static void UB_Message(HWND hwnd, HDC hDC, UINT action)
+     if (action == BN_SETFOCUS)
+         DrawFocusRect(hDC, &rc);
+ 
+-    SendMessageW(parent, WM_COMMAND, MAKEWPARAM(GetWindowLongW(hwnd, GWLP_ID), action), hwnd);
++    SendMessageW(parent, WM_COMMAND, MAKEWPARAM(GetWindowLongW(hwnd, GWLP_ID), action), (LPARAM)hwnd);
+ }
+ 
+ static LRESULT UB_DefWndProc(HWND hwnd, UINT umsg, WPARAM wparam, LPARAM lparam)
+@@ -5023,7 +5086,7 @@ static LRESULT UB_WndProc(HWND hwnd, UINT umsg, WPARAM wparam, LPARAM lparam)
+             break;
+         }
+         case WM_LBUTTONDBLCLK:
+-            SendMessageW(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(GetWindowLongW(hwnd, GWLP_ID), BN_DOUBLECLICKED), hwnd);
++            SendMessageW(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(GetWindowLongW(hwnd, GWLP_ID), BN_DOUBLECLICKED), (LPARAM)hwnd);
+             break;
+         default:
+             ret = UB_DefWndProc(hwnd, umsg, wparam, lparam);
+@@ -5058,11 +5121,11 @@ LRESULT CALLBACK CBTHook(int nCode, WPARAM wParam, LPARAM lParam)
+ 
+         if (create->lpcs->lpszName && !strcmp(create->lpcs->lpszName, "Default IME"))
+         {
+-            SetWindowLongA(hWnd, GWL_HINSTANCE, 0);
++            SetWindowLongPtrA(hWnd, GWLP_HINSTANCE, 0);
+         }
+         if ((window_type_table[HWND_16(hWnd)] == (BYTE)WINDOW_TYPE_BUTTON) && ((create->lpcs->style & BS_TYPEMASK) == BS_USERBUTTON))
+         {
+-            WNDPROC origwndproc = SetWindowLongW(hWnd, GWL_WNDPROC, UB_WndProc);
++            WNDPROC origwndproc = (WNDPROC)SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)UB_WndProc);
+             SetPropA(hWnd, "origwndproc", (HANDLE)origwndproc);
+         }
+         if ((get_windows_build() >= 26100) && (window_type_table[HWND_16(hWnd)] == (BYTE)WINDOW_TYPE_COMBOBOX))
+@@ -5071,8 +5134,8 @@ LRESULT CALLBACK CBTHook(int nCode, WPARAM wParam, LPARAM lParam)
+             SetWindowLongA(hWnd, GWL_STYLE, create->lpcs->style);
+         }	
+     }
+-    else if((nCode == HCBT_MINMAX) && (lParam == SW_MAXIMIZE) && (GetWindowLongA(wParam, GWL_STYLE) & WS_MAXIMIZE))
+-        SetPropA(wParam, "WindowMaximized", 1);
++    else if((nCode == HCBT_MINMAX) && (lParam == SW_MAXIMIZE) && (GetWindowLongA((HWND)wParam, GWL_STYLE) & WS_MAXIMIZE))
++        SetPropA((HWND)wParam, "WindowMaximized", (HANDLE)1);
+     return FALSE;
+ }
+ LRESULT CALLBACK WndProcRetHook(int code, WPARAM wParam, LPARAM lParam)
+@@ -5132,7 +5195,7 @@ LRESULT CALLBACK WndProcRetHook(int code, WPARAM wParam, LPARAM lParam)
+         {
+             char class[6];
+             if (GetClassNameA(pcwp->hwnd, class, ARRAY_SIZE(class)) && !strcmp(class, "Edit") && !SendMessageA(pcwp->hwnd, WM_GETFONT, 0, 0))
+-                SendMessageA(pcwp->hwnd, WM_SETFONT, GetStockObject(SYSTEM_FIXED_FONT), FALSE);
++                SendMessageA(pcwp->hwnd, WM_SETFONT, (WPARAM)GetStockObject(SYSTEM_FIXED_FONT), FALSE);
+         }
+     }
+ 
+@@ -5233,7 +5296,7 @@ static LRESULT WINAPI listbox_win11_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
+         {
+             // some programs set ws_hscroll when they want ws_vscroll
+             // this appears to work in win31 but Windows 11 24H2 broke the compatbility
+-            CREATESTRUCT *cs = lparam;
++            CREATESTRUCT *cs = (CREATESTRUCT *)lparam;
+             if (cs->style & WS_HSCROLL)
+                 cs->style |= WS_VSCROLL;
+             // 24H2 will make integral height listboxes the wrong size
+@@ -5252,7 +5315,7 @@ static LRESULT WINAPI listbox_win11_proc(HWND hwnd, UINT msg, WPARAM wparam, LPA
+         {
+             // some programs expect the listbox to be resized in create 
+             // again Windows 11 24H2 broke the compatbility
+-            CREATESTRUCT *cs = lparam;
++            CREATESTRUCT *cs = (CREATESTRUCT *)lparam;
+             cs->x -= 1;
+             cs->y -= 1;
+             cs->cx += 2;
+@@ -5271,7 +5334,7 @@ static LRESULT WINAPI combobox_win11_proc(HWND hwnd, UINT msg, WPARAM wparam, LP
+         case WM_NCCREATE:
+         {
+             // doing this in WM_CREATE has weird effects
+-            CREATESTRUCT *cs = lparam;
++            CREATESTRUCT *cs = (CREATESTRUCT *)lparam;
+             cs->style |= CBS_NOINTEGRALHEIGHT;
+             SetWindowLongA(hwnd, GWL_STYLE, cs->style);
+             break;
+@@ -5307,10 +5370,10 @@ BOOL WINAPI DllMain(
+         if (get_windows_build() >= 26100)
+         {
+             HWND lbhwnd = CreateWindowExA(0, "LISTBOX", "", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0);
+-            orig_listbox_proc = (WNDPROC)SetClassLongPtrA(lbhwnd, GCL_WNDPROC, listbox_win11_proc);
++            orig_listbox_proc = (WNDPROC)SetClassLongPtrA(lbhwnd, GCLP_WNDPROC, (LONG_PTR)listbox_win11_proc);
+             DestroyWindow(lbhwnd);
+             HWND cbhwnd = CreateWindowExA(0, "COMBOBOX", "", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0);
+-            orig_combobox_proc = (WNDPROC)SetClassLongPtrA(cbhwnd, GCL_WNDPROC, combobox_win11_proc);
++            orig_combobox_proc = (WNDPROC)SetClassLongPtrA(cbhwnd, GCLP_WNDPROC, (LONG_PTR)combobox_win11_proc);
+             DestroyWindow(lbhwnd);
+         }
+     }
+@@ -5321,10 +5384,10 @@ BOOL WINAPI DllMain(
+         if (get_windows_build() >= 26100)
+         {
+             HWND lbhwnd = CreateWindowExA(0, "LISTBOX", "", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0);
+-            SetClassLongPtrA(lbhwnd, GCL_WNDPROC, orig_listbox_proc);
++            SetClassLongPtrA(lbhwnd, GCLP_WNDPROC, (LONG_PTR)orig_listbox_proc);
+             DestroyWindow(lbhwnd);
+             HWND cbhwnd = CreateWindowExA(0, "COMBOBOX", "", 0, 0, 0, 0, 0, HWND_MESSAGE, 0, 0, 0);
+-            SetClassLongPtrA(cbhwnd, GCL_WNDPROC, orig_combobox_proc);
++            SetClassLongPtrA(cbhwnd, GCLP_WNDPROC, (LONG_PTR)orig_combobox_proc);
+             DestroyWindow(cbhwnd);
+         }
+     }
+@@ -5390,7 +5453,7 @@ HWND create_window(CREATESTRUCTW* cs, LPCWSTR className, HINSTANCE instance, BOO
+     CLIENTCREATESTRUCT c32;
+     if (!strncasecmp((LPCSTR)className, "MDICLIENT", strlen((LPCSTR)className)))
+     {
+-        CLIENTCREATESTRUCT16 *c16 = MapSL(cs->lpCreateParams);
++        CLIENTCREATESTRUCT16 *c16 = MapSL((SEGPTR)(ULONG_PTR)cs->lpCreateParams);
+         c32.idFirstChild = c16->idFirstChild;
+         c32.hWindowMenu = HMENU_32(c16->hWindowMenu);
+         cs->lpCreateParams = (LPVOID)&c32;
+@@ -5490,7 +5553,11 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &winproc_cs,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
++#ifdef _WIN64
++      0, 0, 0
++#else
+       0, 0, { (DWORD_PTR)(__FILE__ ": winproc_cs") }
++#endif
+ };
+ static CRITICAL_SECTION winproc_cs = { &critsect_debug, -1, 0, 0, 0, 0 };
+ 
+@@ -5632,7 +5699,7 @@ LRESULT CALLBACK WindowProc16(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lParam)
+             if (dd && !dd->dlgProc)
+             {
+                 void *thunk = (void *)GetWindowLongPtrA(hDlg, DWLP_DLGPROC);
+-                SetWindowLongPtrA(hDlg, DWLP_DLGPROC, NULL);
++                SetWindowLongPtrA(hDlg, DWLP_DLGPROC, 0);
+                 HeapFree(GetProcessHeap(), 0, dd);
+                 free_proc_thunk(thunk);
+                 return TRUE;
+@@ -5651,9 +5718,9 @@ LRESULT CALLBACK WindowProc16(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lParam)
+         msg.lParam = lParam;
+         LRESULT result;
+ 
+-        if (index != -1 && index < MAX_WINPROCS32 && thunk_array && thunk_array[index].proc)
++        if (index != -1 && index < MAX_WINPROCS32 && thunk_array && get_thunk_proc(index))
+         {
+-            WNDPROC wndproc32 = thunk_array[index].proc;
++            WNDPROC wndproc32 = get_thunk_proc(index);
+             if ((Msg == WM_CREATE) && is_mdiclient(hWnd16, hDlg))
+             {
+                 CLIENTCREATESTRUCT16 *c16 = MapSL(*(DWORD *)lParam);
+diff --git a/user/user_private.h b/user/user_private.h
+index ae2e40a7..0d128d1b 100644
+--- a/user/user_private.h
++++ b/user/user_private.h
+@@ -249,6 +249,12 @@ void load_user32_functions();
+ #define strncasecmp _strnicmp
+ __declspec(dllimport) void SetWndProc16(WORD hWnd16, DWORD WndProc);
+ __declspec(dllimport) DWORD GetWndProc16(WORD hWnd16);
++__declspec(dllimport) void SetDlgProc16(WORD hWnd16, DWORD WndProc);
++__declspec(dllimport) DWORD GetDlgProc16(WORD hWnd16);
++/* 16-bit dialog window offsets; DWLP_* differ on 64-bit hosts */
++#define DWL_MSGRESULT16 0
++#define DWL_DLGPROC16   4
++#define DWL_USER16      8
+ #define STR_ATOM_MIN MAXINTATOM
+ #define STR_ATOM_MAX 0xFFFF
+ #define STR_ATOM_SIZE STR_ATOM_MAX - STR_ATOM_MIN
+diff --git a/user/window.c b/user/window.c
+index c4beee9a..9c8f0de4 100644
+--- a/user/window.c
++++ b/user/window.c
+@@ -18,6 +18,7 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <stdlib.h>
+ #include "wine/winuser16.h"
+ #include "wownt32.h"
+ #include "user_private.h"
+@@ -129,12 +130,12 @@ static inline HWND full_insert_after_hwnd( HWND16 hwnd )
+ 
+ BOOL CALLBACK remove_wndproc(HWND hwnd, LPARAM lparam)
+ {
+-    if (GetExePtr(GetWindowWord16(HWND_16(hwnd), GWL_HINSTANCE)) == lparam)
++    if (GetExePtr(GetWindowWord16(HWND_16(hwnd), GWLP_HINSTANCE)) == lparam)
+     {
+         TRACE("HWND %x WNDPROC removed\n", hwnd);
+         EnumChildWindows(hwnd, remove_wndproc, lparam);
+-        if (GetWindowLongPtrA(hwnd, GWL_WNDPROC) == (LONG_PTR)WindowProc16)
+-            SetWindowLongPtrA(hwnd, GWLP_WNDPROC, DefWindowProcA);
++        if (GetWindowLongPtrA(hwnd, GWLP_WNDPROC) == (LONG_PTR)WindowProc16)
++            SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)DefWindowProcA);
+     }
+     return TRUE;
+ }
+@@ -144,10 +145,10 @@ BOOL CALLBACK enum_thread_window(HWND hwnd, LPARAM lparam)
+     struct class_entry *clazz = (struct class_entry*)lparam;
+     if (GetClassWord(hwnd, GCW_ATOM) == clazz->atom)
+     {
+-        if (GetWindowLongPtrA(hwnd, GWLP_WNDPROC) != DefWindowProcA)
++        if (GetWindowLongPtrA(hwnd, GWLP_WNDPROC) != (LONG_PTR)DefWindowProcA)
+         {
+             TRACE("HWND %x WNDPROC removed\n", hwnd);
+-            SetWindowLongPtrA(hwnd, GWLP_WNDPROC, DefWindowProcA);
++            SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)DefWindowProcA);
+         }
+         TRACE("HWND %x destroyed\n", hwnd);
+         DestroyWindow(hwnd);
+@@ -219,7 +220,7 @@ BOOL is_dialog(HWND hwnd)
+         return HIWORD(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE)) == 0xfefe;
+     }
+     /* undocumented, GetWindowLongW(hwnd, -1) returns a pointer to the internal window structure */
+-    struct WW *ww = GetWindowLongW(hwnd, -1);
++    struct WW *ww = (struct WW *)GetWindowLongPtrW(hwnd, -1);
+     if (!ww)
+         return FALSE;
+     __TRY
+@@ -292,6 +293,15 @@ INT16 WINAPI MessageBox16( HWND16 hwnd, LPCSTR text, LPCSTR title, UINT16 type )
+     return ret;
+ }
+ 
++#ifdef __aarch64__
++#include "wine/native_thunk.h"
++typedef struct
++{
++    NATIVE_CLOSURE closure; /* calls func(this, ...) */
++    BOOL used;
++    SEGPTR param;
++} TIMERTHUNK;
++#else
+ #include <pshpack1.h>
+ typedef struct
+ {
+@@ -302,32 +312,42 @@ typedef struct
+     BYTE jmp; /* E9 */
+     UINT_PTR func;
+     BOOL used;
+-    LPVOID param;
++    SEGPTR param;
+ } TIMERTHUNK;
+ #include <poppack.h>
++#endif
+ static TIMERTHUNK *timer_thunk_array;
+ static int MAX_TIMER_THUNK;
+ static void init_timer_thunk()
+ {
+     if (timer_thunk_array)
+         return;
++#ifdef __aarch64__
++    /* the native closures are bigger than the x86 thunks */
++    MAX_TIMER_THUNK = 16384 / sizeof(TIMERTHUNK);
++#else
+     MAX_TIMER_THUNK = 4096 / sizeof(TIMERTHUNK);
++#endif
+     timer_thunk_array = VirtualAlloc(NULL, MAX_TIMER_THUNK * sizeof(TIMERTHUNK), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+ }
+-static TIMERTHUNK *init_timer_thunk_data(LPVOID param, int i, LPVOID func)
++static TIMERTHUNK *init_timer_thunk_data(SEGPTR param, int i, LPVOID func)
+ {
++#ifdef __aarch64__
++    init_native_closure(&timer_thunk_array[i].closure, timer_thunk_array + i, func);
++#else
+     timer_thunk_array[i].pop_eax = 0x58;
+     timer_thunk_array[i].push_imm = 0x68;
+     timer_thunk_array[i].this_ = timer_thunk_array + i;
+     timer_thunk_array[i].push_eax = 0x50;
+     timer_thunk_array[i].jmp = 0xE9;
+     timer_thunk_array[i].func = (UINT_PTR)func - (UINT_PTR)(&timer_thunk_array[i].func + 1);
++#endif
+     timer_thunk_array[i].used = TRUE;
+     timer_thunk_array[i].param = param;
+     return timer_thunk_array + i;
+ }
+ 
+-static TIMERPROC allocate_timer_thunk(LPVOID param, LPVOID func, BOOL re)
++static TIMERPROC allocate_timer_thunk(SEGPTR param, LPVOID func, BOOL re)
+ {
+     init_timer_thunk();
+     if (re)
+@@ -359,7 +379,7 @@ VOID CALLBACK TimerProc_Thunk(TIMERTHUNK *data, HWND hWnd, UINT msg, UINT_PTR wp
+ 
+ BOOL is_timer_thunk(TIMERPROC proc)
+ {
+-    return timer_thunk_array <= proc && proc < timer_thunk_array + MAX_TIMER_THUNK;
++    return (void *)timer_thunk_array <= (void *)proc && (void *)proc < (void *)(timer_thunk_array + MAX_TIMER_THUNK);
+ }
+ 
+ /***********************************************************************
+@@ -370,7 +390,7 @@ UINT16 WINAPI SetTimer16( HWND16 hwnd, UINT16 id, UINT16 timeout, TIMERPROC16 pr
+     TIMERPROC proc32;
+     UINT ret;
+     timeout = timeout < 55 ? 55 : timeout;
+-    if (proc == NULL)
++    if (!proc)
+     {
+         return SetTimer(WIN_Handle32(hwnd), id, timeout, NULL);
+     }
+@@ -385,7 +405,7 @@ UINT16 WINAPI SetTimer16( HWND16 hwnd, UINT16 id, UINT16 timeout, TIMERPROC16 pr
+  */
+ UINT16 WINAPI SetSystemTimer16( HWND16 hwnd, UINT16 id, UINT16 timeout, TIMERPROC16 proc )
+ {
+-    TIMERPROC proc32 = proc == NULL ? NULL : allocate_timer_thunk(proc, TimerProc_Thunk, TRUE);
++    TIMERPROC proc32 = !proc ? NULL : allocate_timer_thunk(proc, TimerProc_Thunk, TRUE);
+     if (!SetSystemTimer)
+     {
+         ERR("SetSystemTimer NULL\n");
+@@ -898,7 +918,7 @@ BOOL16 WINAPI DestroyWindow16( HWND16 hwnd )
+ {
+     DWORD count;
+     BOOL result;
+-    HMENU16 hmenu16 = NULL;
++    HMENU16 hmenu16 = 0;
+     HWND hwnd32 = HWND_32(hwnd);
+     if(!GetMenu(hwnd32)) hmenu16 = GetMenu16(hwnd);
+     ReleaseThunkLock(&count);
+@@ -1367,8 +1387,9 @@ WORD WINAPI GetClassWord16( HWND16 hwnd, INT16 offset )
+     switch (offset)
+     {
+     case GCL_CBCLSEXTRA:
+-    case GCL_HMODULE:
+         return GetClassLongA(WIN_Handle32(hwnd), offset);
++    case GCLP_HMODULE:
++        return (WORD)GetClassLongPtrA(WIN_Handle32(hwnd), offset);
+     case GCL_CBWNDEXTRA:
+     {
+         char cls[1000];
+@@ -1414,7 +1435,7 @@ WORD WINAPI SetClassWord16( HWND16 hwnd, INT16 offset, WORD newval )
+         icon = (HICON)SetClassLongPtrW( WIN_Handle32(hwnd), offset, (ULONG_PTR)get_icon_32(newval) );
+         return get_icon_16( icon );
+     case GCLP_HBRBACKGROUND:
+-        return HBRUSH_16((HBRUSH)SetClassLongPtrW(WIN_Handle32(hwnd), offset, HBRUSH_32(newval)));
++        return HBRUSH_16((HBRUSH)SetClassLongPtrW(WIN_Handle32(hwnd), offset, (LONG_PTR)HBRUSH_32(newval)));
+     }
+     return SetClassWord( WIN_Handle32(hwnd), offset, newval );
+ }
+@@ -1430,14 +1451,30 @@ LRESULT CALLBACK UserAdapterWindowClass(HWND hwnd, UINT msg, WPARAM wparam, LPAR
+  */
+ LONG WINAPI GetClassLong16( HWND16 hwnd16, INT16 offset )
+ {
+-    LONG_PTR ret = GetClassLongA( WIN_Handle32(hwnd16), offset );
++    LONG_PTR ret;
++
++    switch( offset )
++    {
++    case GCLP_WNDPROC:
++    case GCLP_MENUNAME:
++    case GCLP_HCURSOR:
++    case GCLP_HICON:
++    case GCLP_HICONSM:
++    case GCLP_HBRBACKGROUND:
++    case GCLP_HMODULE:
++        /* pointer sized values */
++        ret = GetClassLongPtrA( WIN_Handle32(hwnd16), offset );
++        break;
++    default:
++        ret = GetClassLongA( WIN_Handle32(hwnd16), offset );
++        break;
++    }
+ 
+     switch( offset )
+     {
+     case GCLP_WNDPROC:
+     {
+         ATOM atom = GetClassWord(WIN_Handle32(hwnd16), GCW_ATOM);
+-        WNDPROC proc = GetClassLongPtrA(WIN_Handle32(hwnd16), GCLP_WNDPROC);
+         return WNDCLASS16Info[atom].wndproc ? WNDCLASS16Info[atom].wndproc : (LONG_PTR)WINPROC_GetProc16((WNDPROC)ret, FALSE);
+     }
+     case GCLP_MENUNAME:
+@@ -1447,7 +1484,7 @@ LONG WINAPI GetClassLong16( HWND16 hwnd16, INT16 offset )
+     case GCLP_HICONSM:
+         return get_icon_16( (HICON)ret );
+     case GCLP_HBRBACKGROUND:
+-        return HBRUSH_16(ret);
++        return HBRUSH_16((HBRUSH)ret);
+     default:
+         return ret;
+     }
+@@ -1470,24 +1507,43 @@ LONG WINAPI SetClassLong16( HWND16 hwnd16, INT16 offset, LONG newval )
+         return get_icon_16( icon );
+     case GCLP_WNDPROC:
+         {
+-            WNDPROC new_proc = (WNDPROC16)newval;
++            WNDPROC16 new_proc = (WNDPROC16)newval;
+             //WNDPROC old_proc = (WNDPROC)SetClassLongA( WIN_Handle32(hwnd16), offset, (LONG_PTR)new_proc );
+             ATOM atom = GetClassWord(WIN_Handle32(hwnd16), GCW_ATOM);
+-            WNDPROC old = WNDCLASS16Info[atom].wndproc;
++            WNDPROC16 old = WNDCLASS16Info[atom].wndproc;
+             WNDCLASS16Info[atom].wndproc = new_proc;
+             return old;//(LONG)WINPROC_GetProc16(old_proc, FALSE);
+         }
+     case GCLP_HBRBACKGROUND:
+-        return HBRUSH_32(SetClassLongA(WIN_Handle32(hwnd16), offset, HBRUSH_32(newval)));
++        return HBRUSH_16((HBRUSH)SetClassLongPtrA(WIN_Handle32(hwnd16), offset, (LONG_PTR)HBRUSH_32(newval)));
+     case GCLP_MENUNAME:
+-        newval = (LONG)MapSL( newval );
+-        /* fall through */
++        return (LONG)SetClassLongPtrA( WIN_Handle32(hwnd16), offset, (LONG_PTR)MapSL( newval ) );
+     default:
+         return SetClassLongA( WIN_Handle32(hwnd16), offset, newval );
+     }
+ }
+ 
+ BYTE *hwndwordbuf[65536];
++
++/* 32-bit GetWindowLong/SetWindowLong for a negative (system) offset of the
++ * 16-bit API; the pointer sized values need the *Ptr functions on 64-bit. */
++static LONG get_window_long_32( HWND hwnd, INT offset )
++{
++#ifdef _WIN64
++    if (offset == GWLP_WNDPROC || offset == GWLP_HINSTANCE || offset == GWLP_HWNDPARENT || offset == GWLP_USERDATA)
++        return (LONG)GetWindowLongPtrA( hwnd, offset );
++#endif
++    return GetWindowLongA( hwnd, offset );
++}
++
++static LONG set_window_long_32( HWND hwnd, INT offset, LONG_PTR newval )
++{
++#ifdef _WIN64
++    if (offset == GWLP_WNDPROC || offset == GWLP_HINSTANCE || offset == GWLP_HWNDPARENT || offset == GWLP_USERDATA)
++        return (LONG)SetWindowLongPtrA( hwnd, offset, newval );
++#endif
++    return SetWindowLongA( hwnd, offset, (LONG)newval );
++}
+ //__declspec(dllexport)
+ void SetWindowHInst16(WORD hWnd16, HINSTANCE16 hinst16);
+ //__declspec(dllexport) 
+@@ -1534,14 +1590,14 @@ WORD WINAPI GetWindowWord16( HWND16 hwnd, INT16 offset )
+     {
+     case GWL_STYLE:
+         return (WORD)GetWindowLong16(hwnd, offset);
+-    case GWL_HINSTANCE:
++    case GWLP_HINSTANCE:
+     {
+         HINSTANCE16 h16 = GetWindowHInst16(hwnd);
+         if (h16)
+         {
+             return h16;
+         }
+-        HINSTANCE h = GetWindowLongPtrW(WIN_Handle32(hwnd), offset);
++        HINSTANCE h = (HINSTANCE)GetWindowLongPtrW(WIN_Handle32(hwnd), offset);
+         /* 32-bit dll -> 16-bit hinst mapping? */
+         /* LoadLibrary16 returns hinst GetModuleHandle16 returns hmodule */
+         if (h && (h == GetModuleHandleW(L"COMDLG32.DLL") || h == GetModuleHandleW(L"COMMDLG.DLL16")))
+@@ -1554,7 +1610,7 @@ WORD WINAPI GetWindowWord16( HWND16 hwnd, INT16 offset )
+             }
+         }
+ 
+-        if (h == 0xFFFF0000)
++        if (h == (HINSTANCE)0xFFFF0000)
+         {
+             HINSTANCE16 user = LoadLibrary16("USER");
+             FreeLibrary16(user);
+@@ -1581,8 +1637,8 @@ WORD WINAPI GetWindowWord16( HWND16 hwnd, INT16 offset )
+         LONG ret = GetWindowLongA(WIN_Handle32(hwnd), GWL_ID);
+         return ret;
+     }
+-    case GWL_HWNDPARENT:
+-        return HWND_16(GetWindowLongA(WIN_Handle32(hwnd), offset));
++    case GWLP_HWNDPARENT:
++        return HWND_16((HWND)GetWindowLongPtrA(WIN_Handle32(hwnd), offset));
+     default:
+         break;
+     }
+@@ -1617,11 +1673,11 @@ WORD WINAPI SetWindowWord16( HWND16 hwnd, INT16 offset, WORD newval )
+     }
+     switch (offset)
+     {
+-    case GWL_HINSTANCE:
++    case GWLP_HINSTANCE:
+     {
+         HINSTANCE16 old = (HINSTANCE16)GetWindowWord16(hwnd, offset);
+         SetWindowHInst16(hwnd, newval);
+-        (SetWindowLongA(WIN_Handle32(hwnd), offset, HINSTANCE_32(newval)));
++        (SetWindowLongPtrA(WIN_Handle32(hwnd), offset, (LONG_PTR)HINSTANCE_32(newval)));
+         return old;
+     }
+     case GWL_ID:
+@@ -1629,8 +1685,8 @@ WORD WINAPI SetWindowWord16( HWND16 hwnd, INT16 offset, WORD newval )
+         LONG ret = SetWindowLongA(WIN_Handle32(hwnd), GWL_ID, newval);
+         return ret;
+     }
+-    case GWL_HWNDPARENT:
+-        return (SetWindowLongA(WIN_Handle32(hwnd), offset, HWND_32(newval)));
++    case GWLP_HWNDPARENT:
++        return (WORD)(SetWindowLongPtrA(WIN_Handle32(hwnd), offset, (LONG_PTR)HWND_32(newval)));
+     default:
+         break;
+     }
+@@ -1669,14 +1725,14 @@ LONG WINAPI GetWindowLong16( HWND16 hwnd16, INT16 offset )
+                 return 0;
+             }
+         }
+-        else if (offset == DWLP_DLGPROC)
++        else if (offset == DWL_DLGPROC16)
+         {
+             is_winproc = is_dialog(hwnd);
+         }
+     }
+     if (is_winproc)
+     {
+-        if (offset == DWLP_DLGPROC)
++        if (offset == DWL_DLGPROC16)
+         {
+             retvalue = (LONG_PTR)GetDlgProc16(hwnd16);
+         }
+@@ -1686,7 +1742,7 @@ LONG WINAPI GetWindowLong16( HWND16 hwnd16, INT16 offset )
+         }
+         if (retvalue)
+             return retvalue;
+-        retvalue = GetWindowLongA(hwnd, offset);
++        retvalue = GetWindowLongPtrA(hwnd, offset == DWL_DLGPROC16 ? DWLP_DLGPROC : offset);
+         if (retvalue)
+             retvalue = (LONG_PTR)WINPROC_GetProc16( (WNDPROC)retvalue, FALSE );
+         return retvalue;
+@@ -1707,7 +1763,7 @@ LONG WINAPI GetWindowLong16( HWND16 hwnd16, INT16 offset )
+         }
+         return *(LONG*)(hwndwordbuf[hwnd16] + offset);
+     }
+-    retvalue = GetWindowLongA(hwnd, offset);
++    retvalue = get_window_long_32(hwnd, offset);
+     return retvalue;
+ }
+ 
+@@ -1728,15 +1784,16 @@ LONG WINAPI SetWindowLong16( HWND16 hwnd16, INT16 offset, LONG newval )
+     HWND hwnd = WIN_Handle32( hwnd16 );
+     BOOL is_winproc = (offset == GWLP_WNDPROC);
+ 
+-    if (offset == DWLP_DLGPROC)
++    if (offset == DWL_DLGPROC16)
+         is_winproc = is_dialog(hwnd);
+ 
+ 	if (is_winproc)
+     {
+-        FARPROC oldproc = GetWindowLongA(hwnd, offset);
++        INT offset32 = offset == DWL_DLGPROC16 ? DWLP_DLGPROC : offset;
++        LONG_PTR oldproc = GetWindowLongPtrA(hwnd, offset32);
+         DWORD old = ((LONG_PTR)GetWindowLong16(hwnd16, offset));
+-        WNDPROC new_proc = (WNDPROC16)newval;
+-        if (offset == DWLP_DLGPROC)
++        WNDPROC16 new_proc = (WNDPROC16)newval;
++        if (offset == DWL_DLGPROC16)
+         {
+             SetDlgProc16(hwnd16, new_proc);
+         }
+@@ -1744,17 +1801,17 @@ LONG WINAPI SetWindowLong16( HWND16 hwnd16, INT16 offset, LONG newval )
+         {
+             SetWndProc16(hwnd16, new_proc);//krnl386.exe
+         }
+-        if (offset == DWLP_DLGPROC)
++        if (offset == DWL_DLGPROC16)
+         {
+-            if (oldproc != DlgProc)
++            if (oldproc != (LONG_PTR)DlgProc)
+             {
+                 /* FIXME: set DlgProc */
+-                SetWindowLongA(hwnd, offset, DlgProc);
++                SetWindowLongPtrA(hwnd, offset32, (LONG_PTR)DlgProc);
+             }
+         }
+-        else if (oldproc != WindowProc16)
++        else if (oldproc != (LONG_PTR)WindowProc16)
+         {
+-            SetWindowLongA(hwnd, offset, WindowProc16);
++            SetWindowLongPtrA(hwnd, offset32, (LONG_PTR)WindowProc16);
+         }
+ 		return old;
+     }
+@@ -1776,8 +1833,8 @@ LONG WINAPI SetWindowLong16( HWND16 hwnd16, INT16 offset, LONG newval )
+         *(LONG*)(hwndwordbuf[hwnd16] + offset) = newval;
+         return old;
+     }
+-    else if (offset == GWL_HWNDPARENT)
+-        return (SetWindowLongA(WIN_Handle32(hwnd), offset, HWND_32(newval)));
++    else if (offset == GWLP_HWNDPARENT)
++        return set_window_long_32(WIN_Handle32(HWND_16(hwnd)), offset, (LONG_PTR)HWND_32(newval));
+     else if (offset == GWL_STYLE) // WPWIN61
+     {
+         DWORD count;
+@@ -1786,7 +1843,7 @@ LONG WINAPI SetWindowLong16( HWND16 hwnd16, INT16 offset, LONG newval )
+         RestoreThunkLock(count);
+         return ret;
+     }
+-    /*else*/ return SetWindowLongA( hwnd, offset, newval );
++    /*else*/ return set_window_long_32( hwnd, offset, newval );
+ }
+ 
+ 
+@@ -2599,8 +2656,9 @@ ATOM WINAPI RegisterClassEx16( const WNDCLASSEX16 *wc )
+     SIZE_T buf_len;
+     struct A
+     {
++        /* FormatMessage arguments: one pointer sized slot each */
+         LPCSTR local_class_prefix;
+-        DWORD hInst;
++        DWORD_PTR hInst;
+         LPCSTR name;
+     } a;
+     char atombuf[256];
+@@ -2628,7 +2686,7 @@ ATOM WINAPI RegisterClassEx16( const WNDCLASSEX16 *wc )
+     wc32.hIconSm       = get_icon_32(wc->hIconSm);
+     if (!HIWORD(wc32.lpszClassName))
+     {
+-        GlobalGetAtomNameA(wc32.lpszClassName, atombuf, 256);
++        GlobalGetAtomNameA(LOWORD(wc32.lpszClassName), atombuf, 256);
+         wc32.lpszClassName = atombuf;
+     }
+     a.hInst = inst;
+@@ -2638,7 +2696,7 @@ ATOM WINAPI RegisterClassEx16( const WNDCLASSEX16 *wc )
+     /*
+      * add hModule prefix to classname
+      */
+-    if (FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_STRING, "%1!s!%2!04X!%3!s!%0", NULL, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), &buf, 0, &arg))
++    if (FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_STRING, "%1!s!%2!04X!%3!s!%0", 0, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), &buf, 0, &arg))
+     {
+         wc32.lpszClassName = buf;
+     }
+@@ -2739,7 +2797,7 @@ LPCSTR win16classname(LPCSTR name)
+     {
+         ATOM atom = FindAtomA(name);
+         if (atom != 0)
+-            return atom;
++            return (LPCSTR)MAKEINTATOM(atom);
+     }
+     return name;
+ }
+@@ -2925,7 +2983,7 @@ HWND16 WINAPI FindWindowEx16( HWND16 parent, HWND16 child, LPCSTR className, LPC
+ 
+     if (!HIWORD(className) && LOWORD(className))
+     {
+-        GlobalGetAtomNameA(className, atomname, ARRAYSIZE(atomname));
++        GlobalGetAtomNameA(LOWORD(className), atomname, ARRAYSIZE(atomname));
+         className = atomname;
+     }
+     else if (className && !strcmp(className, "PROGMAN"))
+@@ -3034,7 +3092,7 @@ LRESULT WINAPI DefFrameProc16( HWND16 hwnd, HWND16 hwndMDIClient,
+                               message, wParam, lParam );
+ 	case WM_NCACTIVATE:
+ 		return DefFrameProcA(WIN_Handle32(hwnd), WIN_Handle32(hwndMDIClient),
+-			message, wParam, HRGN_32(lParam));
++			message, wParam, (LPARAM)HRGN_32(lParam));
+ 
+     case WM_NEXTMENU:
+         {
+@@ -3067,7 +3125,7 @@ LRESULT WINAPI DefMDIChildProc16( HWND16 hwnd, UINT16 message,
+         break;
+ 
+     case WM_SETFOCUS:
+-        wParam = HWND_32(wParam);
++        wParam = (WPARAM16)(ULONG_PTR)HWND_32(wParam);
+         break;
+ 
+     case WM_MENUCHAR:
+@@ -3208,7 +3266,7 @@ HWND16 WINAPI CreateWindowEx16( DWORD exStyle, LPCSTR className,
+ 
+     cs.lpCreateParams = data;
+     cs.hInstance      = HINSTANCE_32(instance);
+-    cs.hMenu          = menu;
++    cs.hMenu          = HMENU_32(menu);
+ 	
+     cs.hwndParent     = WIN_Handle32( parent );
+     cs.style          = style;
+@@ -3226,7 +3284,7 @@ HWND16 WINAPI CreateWindowEx16( DWORD exStyle, LPCSTR className,
+         }
+     }
+ 
+-    cs.lpszClass = win32classname(cs.hInstance, cs.lpszClass);
++    cs.lpszClass = win32classname(instance, cs.lpszClass);
+     if (!IS_INTRESOURCE(cs.lpszClass))
+     {
+     }
+@@ -3234,7 +3292,7 @@ HWND16 WINAPI CreateWindowEx16( DWORD exStyle, LPCSTR className,
+     {
+         if (!GlobalGetAtomNameA(LOWORD(className), buffer, sizeof(buffer))) return 0;
+         cs.lpszClass = buffer;
+-        cs.lpszClass = win32classname(cs.hInstance, cs.lpszClass);
++        cs.lpszClass = win32classname(instance, cs.lpszClass);
+     }
+     /* load the menu */
+     if (!menu && !is_win_menu_disallowed(style))
+@@ -3262,7 +3320,7 @@ HWND16 WINAPI CreateWindowEx16( DWORD exStyle, LPCSTR className,
+     if (hwnd == NULL)
+     {
+         ERR("Could not create window(%08x,\"%s\"(\"%s\"),\"%s\",%08x,%04x,%04x,%04x,%04x,%04x,%04x,%04x,%08x)\n", exStyle, IS_INTRESOURCE(className) ? "(ATOM)" : className, cs.lpszClass, windowName, style, x, y, width, height, parent, menu, instance, data);
+-        return NULL;
++        return 0;
+     }
+ 
+     HWND16 hWnd16 = HWND_16(hwnd);

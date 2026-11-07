@@ -1,0 +1,26 @@
+From d76c9730abe7761d79745678638b842b6d195b1b Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:19:11 +0900
+Subject: [PATCH 19/27] arm64: delay-load krnl386.exe16 and libwine.dll in
+ otvdm as the MSVC build does
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ otvdm/CMakeLists.txt | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/otvdm/CMakeLists.txt b/otvdm/CMakeLists.txt
+index b2ff0438..c06cb8e3 100644
+--- a/otvdm/CMakeLists.txt
++++ b/otvdm/CMakeLists.txt
+@@ -12,3 +12,10 @@ target_link_libraries(otvdmw libwine krnl386)
+ if (MSVC)
+     set_target_properties(otvdmw PROPERTIES LINK_FLAGS ${DELAYED_LOADS})
+ endif()
++if (WINEVDM_ARM64 AND NOT(MSVC))
++    # as the MSVC build: krnl386.exe16 lives in dll/, which winevdm.c adds with
++    # SetDllDirectoryW before the first call into it
++    foreach(t otvdm otvdmw)
++        target_link_options(${t} PRIVATE -Wl,-delayload=krnl386.exe16 -Wl,-delayload=libwine.dll)
++    endforeach()
++endif()

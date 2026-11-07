@@ -1,0 +1,231 @@
+From 0a1bbe7fb638d6bdbae1a37202de64122f5a51e4 Mon Sep 17 00:00:00 2001
+From: u <u@example.com>
+Date: Sat, 7 Nov 2026 10:04:03 +0900
+Subject: [PATCH 07/27] arm64: msacm: 16-bit struct layouts with SEGPTR, handle
+ conversions
+
+---
+ msacm/msacm.c     | 29 ++++++++++++++++++------
+ msacm/wineacm16.h | 58 +++++++++++++++++++++++++++++++++--------------
+ 2 files changed, 63 insertions(+), 24 deletions(-)
+
+diff --git a/msacm/msacm.c b/msacm/msacm.c
+index 9170517b..acaff4e6 100644
+--- a/msacm/msacm.c
++++ b/msacm/msacm.c
+@@ -41,6 +41,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(msacm);
+ void WINAPI K32WOWHandle16DestroyHint(HANDLE handle, WOW_HANDLE_TYPE type);
+ #define WOW_TYPE_HANDLE (WOW_TYPE_FULLHWND + 1)
+ #define WOW_TYPE_HAS WOW_TYPE_HANDLE
++/* ARM64 FIXME: 16-bit driver handles were never mapped (the ACM driver functions are stubs); keep passing the value through */
++#define HACMDRIVER_32(h16)		((HACMDRIVER)(ULONG_PTR)(h16))
+ #define HACMSTREAM_16(h32)		WOWHandle16(h32, WOW_TYPE_HAS)
+ #define HACMSTREAM_32(h16)		((HACMSTREAM)WOWHandle32(h16, WOW_TYPE_HAS))
+ /**************************************************************************
+@@ -192,7 +194,7 @@ MMRESULT16 WINAPI acmDriverPriority16(
+ MMRESULT16 WINAPI acmFormatTagDetails16(
+   HACMDRIVER16 had, LPACMFORMATTAGDETAILS16 paftd, DWORD fdwDetails)
+ {
+-  return acmFormatTagDetailsA(had, paftd, fdwDetails);
++  return acmFormatTagDetailsA(HACMDRIVER_32(had), paftd, fdwDetails);
+ }
+ 
+ /***********************************************************************
+@@ -235,7 +237,7 @@ MMRESULT16 WINAPI acmFormatDetails16(
+   afd.pwfx = MapSL(pafd->pwfx);
+   afd.cbwfx = pafd->cbwfx;
+   memcpy(&afd.szFormat, &pafd->szFormat, pafd->cbStruct - (6*4));
+-  ret = acmFormatDetailsA(had, &afd, fdwDetails);
++  ret = acmFormatDetailsA(HACMDRIVER_32(had), &afd, fdwDetails);
+   pafd->dwFormatIndex = afd.dwFormatIndex;
+   pafd->dwFormatTag = afd.dwFormatTag;
+   pafd->fdwSupport = afd.fdwSupport;
+@@ -265,7 +267,7 @@ MMRESULT16 WINAPI acmFormatSuggest16(
+   HACMDRIVER16 had, LPWAVEFORMATEX pwfxSrc,
+   LPWAVEFORMATEX pwfxDst, DWORD cbwfxDst, DWORD fdwSuggest)
+ {
+-  return acmFormatSuggest(had, pwfxSrc, pwfxDst, cbwfxDst, fdwSuggest);
++  return acmFormatSuggest(HACMDRIVER_32(had), pwfxSrc, pwfxDst, cbwfxDst, fdwSuggest);
+ }
+ 
+ /***********************************************************************
+@@ -345,7 +347,7 @@ MMRESULT16 WINAPI acmStreamOpen16(
+     FIXME("ASYNC not supported\n");
+     return MMSYSERR_ERROR;
+   }
+-  ret = acmStreamOpen(&strm, had, pwfxSrc, pwfxDst, pwfltr, dwCallback, dwInstance, fdwOpen);
++  ret = acmStreamOpen(&strm, HACMDRIVER_32(had), pwfxSrc, pwfxDst, pwfltr, dwCallback, dwInstance, fdwOpen);
+   *phas = HACMSTREAM_16(strm);
+   return ret;
+ }
+@@ -374,6 +376,19 @@ MMRESULT16 WINAPI acmStreamSize16(
+     return acmStreamSize(HACMSTREAM_32(has), cbInput, pdwOutputBytes, fdwSize);
+ }
+ 
++/* ARM64: the 32-bit ACMSTREAMHEADER pointer is stored in dwReservedDriver[0..1] (16-bit memory, fixed layout) */
++static LPACMSTREAMHEADER get_pash32(LPACMSTREAMHEADER16 pash)
++{
++  LPACMSTREAMHEADER p;
++  memcpy(&p, pash->dwReservedDriver, sizeof(p));
++  return p;
++}
++
++static void set_pash32(LPACMSTREAMHEADER16 pash, LPACMSTREAMHEADER p)
++{
++  memcpy(pash->dwReservedDriver, &p, sizeof(p));
++}
++
+ /***********************************************************************
+  * 		acmStreamConvert (MSACM.75)
+  */
+@@ -381,7 +396,7 @@ MMRESULT16 WINAPI acmStreamConvert16(
+   HACMSTREAM16 has, LPACMSTREAMHEADER16 pash, DWORD fdwConvert)
+ {
+   MMRESULT ret;
+-  LPACMSTREAMHEADER pash32 = pash->dwReservedDriver[0];
++  LPACMSTREAMHEADER pash32 = get_pash32(pash);
+   pash32->fdwStatus = pash->fdwStatus;
+   pash32->dwUser = pash->dwUser;
+   pash32->pbSrc = MapSL(pash->pbSrc);
+@@ -428,7 +443,7 @@ MMRESULT16 WINAPI acmStreamPrepareHeader16(
+   ret = acmStreamPrepareHeader(HACMSTREAM_32(has), pash32, fdwPrepare);
+   if (!ret)
+   {
+-    pash->dwReservedDriver[0] = pash32;
++    set_pash32(pash, pash32);
+     pash->fdwStatus = pash32->fdwStatus;
+   }
+   else
+@@ -443,7 +458,7 @@ MMRESULT16 WINAPI acmStreamUnprepareHeader16(
+   HACMSTREAM16 has, LPACMSTREAMHEADER16 pash, DWORD fdwUnprepare)
+ {
+   MMRESULT ret;
+-  LPACMSTREAMHEADER pash32 = pash->dwReservedDriver[0];
++  LPACMSTREAMHEADER pash32 = get_pash32(pash);
+   ret = acmStreamUnprepareHeader(HACMSTREAM_32(has), pash32, fdwUnprepare);
+   if (!ret)
+     HeapFree(GetProcessHeap(), 0, pash32);
+diff --git a/msacm/wineacm16.h b/msacm/wineacm16.h
+index 4d1bc612..b81800e6 100644
+--- a/msacm/wineacm16.h
++++ b/msacm/wineacm16.h
+@@ -35,6 +35,15 @@
+ /***********************************************************************
+  * Win16 definitions
+  */
++/* ARM64: pointers inside 16-bit structures are 16:16 (SEGPTR); keep them 32 bits wide */
++#ifdef _WIN64
++#define ACM16_PTR(type) SEGPTR
++#define ACM16_LPARAM LPARAM16
++#else
++#define ACM16_PTR(type) type
++#define ACM16_LPARAM LPARAM
++#endif
++
+ typedef BOOL16 (CALLBACK *ACMDRIVERENUMCB16)(
+   HACMDRIVERID16 hadid, DWORD dwInstance, DWORD fdwSupport
+ );
+@@ -78,23 +87,23 @@ typedef struct _ACMFILTERCHOOSE16
+ 
+   HWND16         hwndOwner;
+ 
+-  LPWAVEFILTER   pwfltr;
++  ACM16_PTR(LPWAVEFILTER) pwfltr;
+   DWORD          cbwfltr;
+ 
+-  LPCSTR         pszTitle;
++  ACM16_PTR(LPCSTR) pszTitle;
+ 
+   char           szFilterTag[ACMFILTERTAGDETAILS_FILTERTAG_CHARS];
+   char           szFilter[ACMFILTERDETAILS_FILTER_CHARS];
+-  LPSTR          pszName;
++  ACM16_PTR(LPSTR) pszName;
+   DWORD          cchName;
+ 
+   DWORD          fdwEnum;
+-  LPWAVEFILTER   pwfltrEnum;
++  ACM16_PTR(LPWAVEFILTER) pwfltrEnum;
+ 
+   HINSTANCE16    hInstance;
+-  LPCSTR         pszTemplateName;
+-  LPARAM         lCustData;
+-  ACMFILTERCHOOSEHOOKPROC16 pfnHook;
++  ACM16_PTR(LPCSTR) pszTemplateName;
++  ACM16_LPARAM lCustData;
++  ACM16_PTR(ACMFILTERCHOOSEHOOKPROC16) pfnHook;
+ } ACMFILTERCHOOSE16, *NPACMFILTERCHOOSE16, *LPACMFILTERCHOOSE16;
+ 
+ typedef struct _ACMFILTERDETAILS16
+@@ -103,7 +112,7 @@ typedef struct _ACMFILTERDETAILS16
+   DWORD          dwFilterIndex;
+   DWORD          dwFilterTag;
+   DWORD          fdwSupport;
+-  LPWAVEFILTER   pwfltr;
++  ACM16_PTR(LPWAVEFILTER) pwfltr;
+   DWORD          cbwfltr;
+   CHAR           szFilter[ACMFILTERDETAILS_FILTER_CHARS];
+ } ACMFILTERDETAILS16, *NPACMFILTERDETAILS16, *LPACMFILTERDETAILS16;
+@@ -126,23 +135,23 @@ typedef struct _ACMFORMATCHOOSE16
+ 
+   HWND16           hwndOwner;
+ 
+-  LPWAVEFORMATEX   pwfx;
++  ACM16_PTR(LPWAVEFORMATEX) pwfx;
+   DWORD            cbwfx;
+-  LPCSTR           pszTitle;
++  ACM16_PTR(LPCSTR) pszTitle;
+ 
+   CHAR             szFormatTag[ACMFORMATTAGDETAILS_FORMATTAG_CHARS];
+   CHAR             szFormat[ACMFORMATDETAILS_FORMAT_CHARS];
+ 
+-  LPSTR            pszName;
++  ACM16_PTR(LPSTR) pszName;
+   DWORD            cchName;
+ 
+   DWORD            fdwEnum;
+-  LPWAVEFORMATEX   pwfxEnum;
++  ACM16_PTR(LPWAVEFORMATEX) pwfxEnum;
+ 
+   HINSTANCE16      hInstance;
+-  LPCSTR           pszTemplateName;
+-  LPARAM           lCustData;
+-  ACMFORMATCHOOSEHOOKPROC16 pfnHook;
++  ACM16_PTR(LPCSTR) pszTemplateName;
++  ACM16_LPARAM lCustData;
++  ACM16_PTR(ACMFORMATCHOOSEHOOKPROC16) pfnHook;
+ } ACMFORMATCHOOSE16, *NPACMFORMATCHOOSE16, *LPACMFORMATCHOOSE16;
+ 
+ typedef struct _ACMFORMATDETAILS16
+@@ -151,7 +160,7 @@ typedef struct _ACMFORMATDETAILS16
+     DWORD            dwFormatIndex;
+     DWORD            dwFormatTag;
+     DWORD            fdwSupport;
+-    LPWAVEFORMATEX   pwfx;
++    ACM16_PTR(LPWAVEFORMATEX) pwfx;
+     DWORD            cbwfx;
+     CHAR             szFormat[ACMFORMATDETAILS_FORMAT_CHARS];
+ } ACMFORMATDETAILS16, *NPACMFORMATDETAILS16, *LPACMFORMATDETAILS16;
+@@ -167,7 +176,22 @@ typedef struct _ACMFORMATTAGDETAILS16
+   CHAR  szFormatTag[ACMFORMATTAGDETAILS_FORMATTAG_CHARS];
+ } ACMFORMATTAGDETAILS16, *NPACMFORMATTAGDETAILS16, *LPACMFORMATTAGDETAILS16;
+ 
+-typedef ACMSTREAMHEADER ACMSTREAMHEADER16, *NPACMSTREAMHEADER16, *LPACMSTREAMHEADER16;
++/* ARM64: explicit 16-bit layout (the 32-bit ACMSTREAMHEADER holds 64-bit members on ARM64) */
++typedef struct _ACMSTREAMHEADER16
++{
++  DWORD cbStruct;
++  DWORD fdwStatus;
++  DWORD dwUser;
++  SEGPTR pbSrc;
++  DWORD cbSrcLength;
++  DWORD cbSrcLengthUsed;
++  DWORD dwSrcUser;
++  SEGPTR pbDst;
++  DWORD cbDstLength;
++  DWORD cbDstLengthUsed;
++  DWORD dwDstUser;
++  DWORD dwReservedDriver[10];
++} ACMSTREAMHEADER16, *NPACMSTREAMHEADER16, *LPACMSTREAMHEADER16;
+ 
+ typedef BOOL16 (CALLBACK *ACMFILTERENUMCB16)(
+  HACMDRIVERID16 hadid, LPACMFILTERDETAILS16 pafd,

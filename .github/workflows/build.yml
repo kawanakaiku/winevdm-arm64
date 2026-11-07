@@ -1,0 +1,63 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # upstream winevdm (otvdm) commit the patches apply to
+  WINEVDM_COMMIT: b88d7f8736d77baa5710eb0c35f81b489540c1a0
+  LLVM_MINGW: llvm-mingw-20260908-ucrt-ubuntu-22.04-x86_64
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build bison flex zip binutils
+
+      - name: Install llvm-mingw
+        run: |
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/$LLVM_MINGW.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch winevdm and apply the patches
+        run: |
+          git init -q winevdm
+          git -C winevdm fetch -q --depth 1 https://github.com/otya128/winevdm.git "$WINEVDM_COMMIT"
+          git -C winevdm checkout -q FETCH_HEAD
+          git -C winevdm -c user.name=ci -c user.email=ci@localhost am -q --keep-cr ../patches/*.patch
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Package
+        id: package
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then name="otvdm-arm64-$GITHUB_REF_NAME"; else name="otvdm-arm64-${GITHUB_SHA::8}"; fi
+          ./package.sh "$name"
+          sha256sum "out/$name.zip" | tee "out/$name.zip.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: out/${{ steps.package.outputs.name }}/
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "out/${{ steps.package.outputs.name }}.zip" "out/${{ steps.package.outputs.name }}.zip.sha256" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "otvdm (winevdm) built for aarch64-windows from otya128/winevdm@${WINEVDM_COMMIT::8} with the patches in this repository. See README.md."

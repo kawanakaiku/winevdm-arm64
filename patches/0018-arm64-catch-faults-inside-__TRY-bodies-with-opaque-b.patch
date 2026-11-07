@@ -1,0 +1,87 @@
+From 523a860c035ae42f44d55b841eb5d2fe2e232d2d Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:17:01 +0900
+Subject: [PATCH 18/27] arm64: catch faults inside __TRY bodies with opaque
+ barrier calls
+
+clang only implements synchronous SEH on ARM64: a load or store that
+faults directly in a __try body is outside the try range, and a body
+without calls loses its __except. -fasync-exceptions would fix that but
+crashes clang (vm86) or the assembler (rmpatch). Calling an opaque
+libwine function at both ends of the body keeps the body inside the
+range; verified on Hangover's aarch64 Wine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt        |  5 -----
+ wine/ldt2.c           |  8 ++++++++
+ wine/wine/exception.h | 17 +++++++++++++++++
+ 3 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2a184b3f..99c02632 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,11 +28,6 @@ if (WINEVDM_ARM64)
+         # but not the type mismatches between same-size pointers
+         string(APPEND CMAKE_C_FLAGS " -fms-extensions -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -Wno-error=incompatible-pointer-types -Wno-error=return-mismatch -Wno-error=incompatible-function-pointer-types")
+         string(APPEND CMAKE_CXX_FLAGS " -fms-extensions")
+-        # __try must also catch faults raised by loads and stores inside the
+-        # __try body itself (the 16-bit memory accessors get inlined there):
+-        # the clang driver drops -fasync-exceptions for mingw, so pass it to cc1
+-        string(APPEND CMAKE_C_FLAGS " -Xclang -fasync-exceptions")
+-        string(APPEND CMAKE_CXX_FLAGS " -Xclang -fasync-exceptions")
+         # lld always marks ARM64 images DYNAMIC_BASE, so Wine maps the DLLs in its
+         # 32-bit ASLR range (below 0x7c000000) when the image base is below 4GB;
+         # code that 16-bit modules see must therefore never rely on the preferred base.
+diff --git a/wine/ldt2.c b/wine/ldt2.c
+index 287b9db1..aa1cc2eb 100644
+--- a/wine/ldt2.c
++++ b/wine/ldt2.c
+@@ -316,3 +316,11 @@ __DEFINE_SET_SEG(gs)
+ #undef __DEFINE_GET_SEG
+ #undef __DEFINE_SET_SEG
+ #endif
++
++#if defined(__aarch64__) && defined(__clang__)
++/* see __TRY in wine/exception.h: an opaque call that marks the ends of a __try body
++ * (exported by the export-all-symbols default of libwine: no dllexport here) */
++void __wine_seh_barrier(void)
++{
++}
++#endif
+diff --git a/wine/wine/exception.h b/wine/wine/exception.h
+index e2a82e64..29e83a52 100644
+--- a/wine/wine/exception.h
++++ b/wine/wine/exception.h
+@@ -84,6 +84,22 @@ extern "C" {
+  */
+ #ifdef USE_COMPILER_EXCEPTIONS
+ 
++#if defined(__aarch64__) && defined(__clang__)
++/* clang only knows synchronous SEH on ARM64: a fault raised by a load or a store in
++ * the __try body itself is not covered, and a body without calls even loses its
++ * __except. Calls to an opaque function at both ends of the body put the body inside
++ * the try range (-fasync-exceptions crashes clang or the assembler on these sources). */
++extern void __wine_seh_barrier(void);
++#define __TRY __try { __wine_seh_barrier();
++#define __WINE_SEH_END __wine_seh_barrier(); }
++#define __EXCEPT(func) __WINE_SEH_END __except((func)(GetExceptionInformation()))
++#define __EXCEPT_CTX(func, ctx) __WINE_SEH_END __except((func)(GetExceptionInformation(), ctx))
++#define __FINALLY(func) __WINE_SEH_END __finally { (func)(!AbnormalTermination()); }
++#define __FINALLY_CTX(func, ctx) __WINE_SEH_END __finally { (func)(!AbnormalTermination(), ctx); }
++#define __ENDTRY /*nothing*/
++#define __EXCEPT_PAGE_FAULT __WINE_SEH_END __except(GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION)
++#define __EXCEPT_ALL __WINE_SEH_END __except(EXCEPTION_EXECUTE_HANDLER)
++#else
+ #define __TRY __try
+ #define __EXCEPT(func) __except((func)(GetExceptionInformation()))
+ #define __EXCEPT_CTX(func, ctx) __except((func)(GetExceptionInformation(), ctx))
+@@ -92,6 +108,7 @@ extern "C" {
+ #define __ENDTRY /*nothing*/
+ #define __EXCEPT_PAGE_FAULT __except(GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION)
+ #define __EXCEPT_ALL __except(EXCEPTION_EXECUTE_HANDLER)
++#endif
+ 
+ #else  /* USE_COMPILER_EXCEPTIONS */
+ 

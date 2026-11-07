@@ -1,0 +1,182 @@
+From e56ef8e1a295bbb35232374fce6c729bdb323cc6 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:16:51 +0900
+Subject: [PATCH 25/27] arm64: olecli: 16-bit handles for objects and client
+ documents
+
+- LHCLIENTDOC is a LONG on the 16-bit side; widen it explicitly and
+  return it through a local in OleRegisterClientDoc16.
+- OleClone16 wrote a 32-bit LPOLEOBJECT into 16-bit memory; return the
+  opaque 16-bit handle like the other entry points.
+- OleCreateFromClip16 passed the 16-bit OLECLIENT and result pointer
+  straight to olecli32; use get_ole_client32 and a local result.
+- Object handle conversions go through ULONG_PTR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ olecli/olecli.c | 50 +++++++++++++++++++++++++++++++------------------
+ 1 file changed, 32 insertions(+), 18 deletions(-)
+
+diff --git a/olecli/olecli.c b/olecli/olecli.c
+index 3c36091a..ef73b538 100644
+--- a/olecli/olecli.c
++++ b/olecli/olecli.c
+@@ -152,14 +152,16 @@ struct ole_client_info *find_ole_client_16(SEGPTR client)
+     return NULL;
+ }
+ 
++/* The 16-bit side gets the olecli32 object pointer as an opaque handle.
++ * FIXME ARM64: assumes olecli32 objects are below 4GB. */
+ static SEGPTR OLEOBJ16(LPOLEOBJECT oleobj)
+ {
+-    return (SEGPTR)oleobj;
++    return (SEGPTR)(ULONG_PTR)oleobj;
+ }
+ 
+ static LPOLEOBJECT OLEOBJ32(SEGPTR oleobj)
+ {
+-    return (LPOLEOBJECT)oleobj;
++    return (LPOLEOBJECT)(ULONG_PTR)oleobj;
+ }
+ #include "wine/list.h"
+ 
+@@ -290,7 +292,7 @@ static LPOLESTREAM OLESTREAM_32(SEGPTR stream16)
+ /******************************************************************************
+  *		OleSavedClientDoc	[OLECLI.45]
+  */
+-OLESTATUS WINAPI OleSavedClientDoc16(LHCLIENTDOC hDoc)
++OLESTATUS WINAPI OleSavedClientDoc16(LONG /* LHCLIENTDOC */ hDoc)
+ {
+     return OleSavedClientDoc(hDoc);
+ }
+@@ -299,15 +301,18 @@ OLESTATUS WINAPI OleSavedClientDoc16(LHCLIENTDOC hDoc)
+  *		OleRegisterClientDoc	[OLECLI.41]
+  */
+ OLESTATUS WINAPI OleRegisterClientDoc16(LPCSTR classname, LPCSTR docname,
+-                                        LONG reserved, LHCLIENTDOC *hRet )
++                                        LONG reserved, LONG /* LHCLIENTDOC16 */ *hRet )
+ {
+-    return OleRegisterClientDoc(classname, docname, reserved, hRet);
++    LHCLIENTDOC h = 0;
++    OLESTATUS status = OleRegisterClientDoc(classname, docname, reserved, &h);
++    *hRet = (LONG)h; /* FIXME ARM64: assumes the handle fits in a LONG */
++    return status;
+ }
+ 
+ /******************************************************************************
+  *		OleRenameClientDoc	[OLECLI.43]
+  */
+-OLESTATUS WINAPI OleRenameClientDoc16(LHCLIENTDOC hDoc, LPCSTR newName)
++OLESTATUS WINAPI OleRenameClientDoc16(LONG /* LHCLIENTDOC */ hDoc, LPCSTR newName)
+ {
+     return OleRenameClientDoc(hDoc, newName);
+ }
+@@ -315,7 +320,7 @@ OLESTATUS WINAPI OleRenameClientDoc16(LHCLIENTDOC hDoc, LPCSTR newName)
+ /******************************************************************************
+  *		OleRevokeClientDoc	[OLECLI.42]
+  */
+-OLESTATUS WINAPI OleRevokeClientDoc16(LHCLIENTDOC hServerDoc)
++OLESTATUS WINAPI OleRevokeClientDoc16(LONG /* LHCLIENTDOC */ hServerDoc)
+ {
+     return OleRevokeClientDoc(hServerDoc);
+ }
+@@ -323,7 +328,7 @@ OLESTATUS WINAPI OleRevokeClientDoc16(LHCLIENTDOC hServerDoc)
+ /******************************************************************************
+  *		OleRevertClientDoc	[OLECLI.44]
+  */
+-OLESTATUS WINAPI OleRevertClientDoc16(LHCLIENTDOC hServerDoc)
++OLESTATUS WINAPI OleRevertClientDoc16(LONG /* LHCLIENTDOC */ hServerDoc)
+ {
+     return OleRevertClientDoc(hServerDoc);
+ }
+@@ -331,7 +336,7 @@ OLESTATUS WINAPI OleRevertClientDoc16(LHCLIENTDOC hServerDoc)
+ /******************************************************************************
+  *		OleEnumObjects	[OLECLI.47]
+  */
+-OLESTATUS WINAPI OleEnumObjects16(LHCLIENTDOC hServerDoc, SEGPTR *data)
++OLESTATUS WINAPI OleEnumObjects16(LONG /* LHCLIENTDOC */ hServerDoc, SEGPTR *data)
+ {
+     LPOLEOBJECT obj32 = OLEOBJ32(*data);
+     OLESTATUS result = OleEnumObjects(hServerDoc, &obj32);
+@@ -342,7 +347,7 @@ OLESTATUS WINAPI OleEnumObjects16(LHCLIENTDOC hServerDoc, SEGPTR *data)
+ /******************************************************************************
+  *	     OleCreateLinkFromClip	[OLECLI.11]
+  */
+-OLESTATUS WINAPI OleCreateLinkFromClip16( LPCSTR name, SEGPTR olecli, LHCLIENTDOC hclientdoc,
++OLESTATUS WINAPI OleCreateLinkFromClip16( LPCSTR name, SEGPTR olecli, LONG /* LHCLIENTDOC */ hclientdoc,
+                                           LPCSTR xname, SEGPTR *lpoleob, OLEOPT_RENDER render,
+                                           OLECLIPFORMAT clipformat )
+ {
+@@ -389,11 +394,18 @@ OLESTATUS WINAPI OleQueryType16(SEGPTR oleobj16,  LPLONG xlong) {
+ /******************************************************************************
+  *		OleCreateFromClip	[OLECLI.12]
+  */
+-OLESTATUS WINAPI OleCreateFromClip16( LPCSTR name, SEGPTR olecli, LHCLIENTDOC hclientdoc,
++OLESTATUS WINAPI OleCreateFromClip16( LPCSTR name, SEGPTR olecli, LONG /* LHCLIENTDOC */ hclientdoc,
+                                       LPCSTR xname, SEGPTR lpoleob,
+                                       UINT16 render, UINT16 clipformat )
+ {
+-    return OleCreateFromClip(name, MapSL(olecli), hclientdoc, xname, MapSL(lpoleob), render, clipformat);
++    /* was MapSL(olecli) and MapSL(lpoleob): a 16-bit OLECLIENT is not an
++     * OLECLIENT, and the result is a handle for the 16-bit side */
++    LPOLECLIENT olecli32 = get_ole_client32(olecli);
++    LPOLEOBJECT obj32 = 0;
++    OLESTATUS status = OleCreateFromClip(name, olecli32, hclientdoc, xname, &obj32, render, clipformat);
++    if (lpoleob)
++        *(SEGPTR *)MapSL(lpoleob) = OLEOBJ16(obj32);
++    return status;
+ }
+ 
+ int CALLBACK ole_client_Callback(LPOLECLIENT client, OLE_NOTIFICATION notif, LPOLEOBJECT oleobject)
+@@ -432,7 +444,7 @@ LPOLECLIENT get_ole_client32(SEGPTR client)
+     info->vtable16 = clientp->lpvtbl;
+     return &info->client;
+ }
+-OLESTATUS WINAPI OleCreate16(LPCSTR name, SEGPTR client, LPCSTR xname, LHCLIENTDOC hclientdoc, LPCSTR xxname, SEGPTR *oleobject, OLEOPT_RENDER render, OLECLIPFORMAT format)
++OLESTATUS WINAPI OleCreate16(LPCSTR name, SEGPTR client, LPCSTR xname, LONG /* LHCLIENTDOC */ hclientdoc, LPCSTR xxname, SEGPTR *oleobject, OLEOPT_RENDER render, OLECLIPFORMAT format)
+ {
+     LPOLECLIENT client32 = get_ole_client32(client);
+     LPOLEOBJECT obj32 = 0;
+@@ -563,7 +575,7 @@ OLESTATUS WINAPI OleSetTargetDevice16(SEGPTR oleobj16, HGLOBAL16 hotd)
+     return status;
+ }
+ 
+-OLESTATUS WINAPI OleCreateFromFile16(LPCSTR protocol, SEGPTR client, LPCSTR lpszClass, LPCSTR file, LHCLIENTDOC clientdoc, LPCSTR objname, SEGPTR *lplpObject, OLEOPT_RENDER render, OLECLIPFORMAT fmt)
++OLESTATUS WINAPI OleCreateFromFile16(LPCSTR protocol, SEGPTR client, LPCSTR lpszClass, LPCSTR file, LONG /* LHCLIENTDOC */ clientdoc, LPCSTR objname, SEGPTR *lplpObject, OLEOPT_RENDER render, OLECLIPFORMAT fmt)
+ {
+     LPOLECLIENT client32 = get_ole_client32(client);
+     LPOLEOBJECT obj32 = 0;
+@@ -788,11 +800,13 @@ OLESTATUS WINAPI OleCopyToClipboard16(SEGPTR oleobj16)
+     return result;
+ }
+ 
+-OLESTATUS WINAPI OleClone16(SEGPTR oleobj16, SEGPTR client, LHCLIENTDOC doc, LPCSTR name, LPOLEOBJECT *lplpobj)
++OLESTATUS WINAPI OleClone16(SEGPTR oleobj16, SEGPTR client, LONG /* LHCLIENTDOC */ doc, LPCSTR name, SEGPTR *lplpobj)
+ {
+     LPOLEOBJECT oleobj = OLEOBJ32(oleobj16);
+     LPOLECLIENT client32 = get_ole_client32(client);
+-    OLESTATUS result = OleClone(oleobj, client32, doc, name, lplpobj);
++    LPOLEOBJECT obj32 = 0;
++    OLESTATUS result = OleClone(oleobj, client32, doc, name, &obj32);
++    *lplpobj = OLEOBJ16(obj32); /* 16-bit memory: a handle, not a 32-bit pointer */
+     return result;
+ }
+ OLESTATUS WINAPI OleSaveToStream16(SEGPTR oleobj16, SEGPTR lpStream)
+@@ -802,7 +816,7 @@ OLESTATUS WINAPI OleSaveToStream16(SEGPTR oleobj16, SEGPTR lpStream)
+     OLESTATUS result = OleSaveToStream(oleobj, stream);
+     return result;
+ }
+-OLESTATUS WINAPI OleLoadFromStream16(SEGPTR lpStream16, LPCSTR protocol, SEGPTR client, LHCLIENTDOC doc, LPCSTR objname, SEGPTR *lplpoleobj16)
++OLESTATUS WINAPI OleLoadFromStream16(SEGPTR lpStream16, LPCSTR protocol, SEGPTR client, LONG /* LHCLIENTDOC */ doc, LPCSTR objname, SEGPTR *lplpoleobj16)
+ {
+     LPOLESTREAM stream32 = OLESTREAM_32(lpStream16);
+     LPOLECLIENT client32 = get_ole_client32(client);
+@@ -832,7 +846,7 @@ OLESTATUS WINAPI OleQueryName16(SEGPTR oleobj16, LPSTR name, UINT16 *lpbufsize)
+     return result;
+ }
+ 
+-OLESTATUS WINAPI OleCreateInvisible16(LPCSTR protocol, SEGPTR olecli16, LPCSTR cls, LHCLIENTDOC doc, LPCSTR obj, SEGPTR *lplpoleobj16, OLEOPT_RENDER renderopt, OLECLIPFORMAT fmt, BOOL actv)
++OLESTATUS WINAPI OleCreateInvisible16(LPCSTR protocol, SEGPTR olecli16, LPCSTR cls, LONG /* LHCLIENTDOC */ doc, LPCSTR obj, SEGPTR *lplpoleobj16, OLEOPT_RENDER renderopt, OLECLIPFORMAT fmt, BOOL actv)
+ {
+     LPOLECLIENT client32 = get_ole_client32(olecli16);
+     LPOLEOBJECT obj32 = NULL;

@@ -1,0 +1,1266 @@
+From b1dfde3948bc1e2bfeb1dd626d3587de483cb965 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 10:07:02 +0900
+Subject: [PATCH 03/27] arm64: krnl386, vm86, libwine, otvdm build
+
+- relay: on ARM64 call the typed convspec relay function of the entry
+  point; thunks built at run time use relay_call_from_16 as relay and
+  get their arguments from the CALLFROM16 argument types (64-bit
+  pointers, sign extended LONG).  call_entry_point is plain C.
+- ne_module: add the image base to the image relative addresses that
+  convspec stores in the 16-bit code segment.
+- Accessors for STACK16FRAME.frame32 and the TDB event handle.
+- Fix pointer/integer mixups found by the 64-bit build.
+- Disable the i386 only DPMI real mode callback assembly.
+- convspec: export __wine_spec_dos_header without decoration on ARM64.
+- wine_common_ver.rc: llvm-rc does not join adjacent strings.
+---
+ convspec/spec16.c            |   1 +
+ krnl386/compat.c             |   1 +
+ krnl386/dosvm.c              |   8 +-
+ krnl386/file.c               |   4 +-
+ krnl386/global.c             |   6 +-
+ krnl386/instr.c              |   2 +-
+ krnl386/int10.c              |   2 +-
+ krnl386/int31.c              |   8 +-
+ krnl386/interrupts.c         |   2 +-
+ krnl386/kernel.c             |   5 ++
+ krnl386/ne_module.c          |  54 +++++++++---
+ krnl386/ne_segment.c         |   6 +-
+ krnl386/relay.c              | 161 ++++++++++++++++++++++++++++++++++-
+ krnl386/resource.c           |  12 +--
+ krnl386/selector.c           |   6 +-
+ krnl386/snoop.c              |   2 +-
+ krnl386/stub.c               |   6 +-
+ krnl386/syslevel.c           |   2 +-
+ krnl386/task.c               |  34 ++++----
+ krnl386/thunk.c              |  18 ++--
+ krnl386/utthunk.c            |   2 +-
+ krnl386/vga.c                |   6 +-
+ krnl386/vxd.c                |   2 +-
+ krnl386/wow_handle.c         |  18 ++--
+ krnl386/wowthunk.c           |   2 +-
+ otvdm/winevdm.c              |   8 +-
+ vm86/msdos.cpp               |   5 +-
+ wine/wine/port.h             |   2 +-
+ wine/wine/winbase16.h        |  18 ++++
+ wine/wine/wine_common_ver.rc |   4 +
+ wow32/wow_main.c             |   4 +-
+ 31 files changed, 317 insertions(+), 94 deletions(-)
+
+diff --git a/convspec/spec16.c b/convspec/spec16.c
+index 61d2f2a3..617eda7c 100644
+--- a/convspec/spec16.c
++++ b/convspec/spec16.c
+@@ -798,6 +798,7 @@ static void output_module16( DLLSPEC *spec )
+     output( ".L___wine_spec_dos_header:\n" );
+     output( "___wine_spec_dos_header:\n" );
+ #else
++    if (target_cpu != CPU_x86) output( "\t.globl __wine_spec_dos_header\n" );
+     output( ".globl ___wine_spec_dos_header\n" );
+     output( ".L__wine_spec_dos_header:\n" );
+     output( "___wine_spec_dos_header:\n" );
+diff --git a/krnl386/compat.c b/krnl386/compat.c
+index 0849f2b6..2df95511 100644
+--- a/krnl386/compat.c
++++ b/krnl386/compat.c
+@@ -1,4 +1,5 @@
+ #include <windows.h>
++#include <stdio.h>
+ #include "kernel16_private.h"
+ 
+ // this only currently will get the flags for the first task
+diff --git a/krnl386/dosvm.c b/krnl386/dosvm.c
+index 059afcea..f385d0fe 100644
+--- a/krnl386/dosvm.c
++++ b/krnl386/dosvm.c
+@@ -110,7 +110,7 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &qcrit,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": qcrit") }
++      0, 0, { 0 }
+ };
+ static CRITICAL_SECTION qcrit = { &critsect_debug, -1, 0, 0, 0, 0 };
+ 
+@@ -746,8 +746,8 @@ void WINAPI DOSVM_AcknowledgeIRQ( CONTEXT86 *context )
+  * overhead. Use of this routine also preserves precious DOS
+  * conventional memory.
+  */
+-LPVOID DOSVM_umb_bottom = DOSVM_UMB_BOTTOM;
+-LPVOID DOSVM_umb_top = DOSVM_UMB_TOP;
++LPVOID DOSVM_umb_bottom = (LPVOID)DOSVM_UMB_BOTTOM;
++LPVOID DOSVM_umb_top = (LPVOID)DOSVM_UMB_TOP;
+ static LPVOID DOSVM_AllocUMB( DWORD size )
+ {
+ 	//not wine
+@@ -755,7 +755,7 @@ static LPVOID DOSVM_AllocUMB( DWORD size )
+ 	{
+         DOSVM_umb_free = (size_t)DOSMEM_dosmem + DOSVM_umb_free;
+ 		//DOSVM_umb_free = malloc(DOSVM_UMB_TOP - DOSVM_UMB_BOTTOM);
+-		DOSVM_umb_bottom = DOSVM_umb_free;
++		DOSVM_umb_bottom = (LPVOID)(ULONG_PTR)DOSVM_umb_free;
+ 		DOSVM_umb_top = (BYTE*)DOSVM_umb_bottom + DOSVM_UMB_TOP - DOSVM_UMB_BOTTOM;
+ 		//LPVOID ret = VirtualAlloc(DOSVM_UMB_BOTTOM, DOSVM_UMB_TOP - DOSVM_UMB_BOTTOM, MEM_COMMIT, PAGE_READWRITE);//DOSVM_UMB_TOP    0xeffff
+ 	}
+diff --git a/krnl386/file.c b/krnl386/file.c
+index c84c3439..bfa4ecda 100644
+--- a/krnl386/file.c
++++ b/krnl386/file.c
+@@ -282,7 +282,7 @@ static LPCSTR strdupWtoOEM(LPCWSTR str)
+ 
+ static HANDLE *FILE_GetTable()
+ {
+-    static DWORD dos_handles_index = NULL;
++    static DWORD dos_handles_index = 0;
+     if (!dos_handles_index) dos_handles_index = TlsAlloc();
+     HANDLE *dos_handles = TlsGetValue(dos_handles_index);
+     if (!dos_handles)
+@@ -479,7 +479,7 @@ INT16 WINAPI GetProfileString16( LPCSTR section, LPCSTR entry, LPCSTR def_val,
+         lf.lfCharSet = DEFAULT_CHARSET;
+         lf.lfPitchAndFamily = 0;
+         lf.lfFaceName[0] = 0;
+-        ret = EnumFontFamiliesExA(hdc, &lf, enum_ini_font, entry, 0);
++        ret = EnumFontFamiliesExA(hdc, &lf, enum_ini_font, (LPARAM)entry, 0);
+         ReleaseDC(0, hdc);
+         if (!ret)
+             strncpy(buffer, "vgaoem.fon", len); // actual filename is unavailable
+diff --git a/krnl386/global.c b/krnl386/global.c
+index 6ffccabe..2342a3c9 100644
+--- a/krnl386/global.c
++++ b/krnl386/global.c
+@@ -1372,14 +1372,14 @@ void WINAPI DibMapGlobalMemory(WORD sel, void *base, DWORD size)
+     int i;
+     if (!sel) /* not hglobal */
+     {
+-        SetSelectorBase(sel, base);
++        SetSelectorBase(sel, (DWORD)(ULONG_PTR)base);
+         return;
+     }
+     pArena->dib_avail_size = size;
+     pArena->base = base;
+     for (i = 0; i < pArena->selCount; i++)
+     {
+-        SetSelectorBase(sel + i * 8, (LPBYTE)base + i * 0x10000);
++        SetSelectorBase(sel + i * 8, (DWORD)(ULONG_PTR)((LPBYTE)base + i * 0x10000));
+     }
+ }
+ 
+@@ -1398,7 +1398,7 @@ void WINAPI DibUnmapGlobalMemory(void *base, DWORD size)
+             pArena->dib_avail_size = 0;
+             pArena->base = (LPBYTE)heap + ((SIZE_T)pArena->base - (SIZE_T)base);
+             for (i = 0; i < pArena->selCount; i++)
+-                SetSelectorBase(pArena->handle + i * 8, (LPBYTE)pArena->base + i * 0x10000);
++                SetSelectorBase(pArena->handle + i * 8, (DWORD)(ULONG_PTR)((LPBYTE)pArena->base + i * 0x10000));
+         }
+     }
+ }
+diff --git a/krnl386/instr.c b/krnl386/instr.c
+index 669d13ae..72d9a12d 100644
+--- a/krnl386/instr.c
++++ b/krnl386/instr.c
+@@ -930,5 +930,5 @@ void WINAPI NetBIOSCall16( CONTEXT86 *context )
+ FARPROC16 WINAPI GetSetKernelDOSProc16( FARPROC16 DosProc )
+ {
+     FIXME("(DosProc=%p): stub\n", DosProc);
+-    return NULL;
++    return 0;
+ }
+diff --git a/krnl386/int10.c b/krnl386/int10.c
+index 5cdfcb3a..88f7d879 100644
+--- a/krnl386/int10.c
++++ b/krnl386/int10.c
+@@ -451,7 +451,7 @@ static BOOL INT10_FillModeInformation( struct _ModeInfoBlock *mib, WORD mode )
+         vga_fb_data = VirtualAlloc(NULL, 4*1024*1024, MEM_COMMIT, PAGE_READWRITE);
+         vga_fb_size = 4*1024*1024;  // enough to fix largest resolution
+     }
+-    mib->PhysBasePtr = vga_fb_data;
++    mib->PhysBasePtr = (DWORD)(ULONG_PTR)vga_fb_data;
+ 
+     /* 44 - DWORD: reserved, always zero */
+     mib->Reserved2 = 0;
+diff --git a/krnl386/int31.c b/krnl386/int31.c
+index bb001266..ca834cba 100644
+--- a/krnl386/int31.c
++++ b/krnl386/int31.c
+@@ -307,7 +307,9 @@ static LPVOID DPMI_xrealloc( LPVOID ptr, DWORD newsize )
+ 
+ 
+ extern void DPMI_CallRMCB32(RMCB *rmcb, UINT16 ss, DWORD esp, UINT16*es, DWORD*edi);
+-#if 0 /* original code, which early gccs puke on */
++#if !defined(__i386__)
++/* not available: DPMI_CallRMCB32 is the stub in stub.c */
++#elif 0 /* original code, which early gccs puke on */
+ {
+     int _clobber;
+     __asm__ __volatile__(
+@@ -700,7 +702,7 @@ FARPROC16 DPMI_AllocInternalRMCB( RMCBPROC proc )
+         NewRMCB->regs_sel = 0;
+         return (FARPROC16)(NewRMCB->address);
+     }
+-    return NULL;
++    return 0;
+ }
+ 
+ 
+@@ -1057,7 +1059,7 @@ void WINAPI DOSVM_Int31Handler( CONTEXT86 *context )
+             }
+             else
+             {
+-                void *base = GetSelectorBase(sel);
++                DWORD base = GetSelectorBase(sel);
+                 SET_CX( context, HIWORD(base) );
+                 SET_DX( context, LOWORD(base) );
+             }
+diff --git a/krnl386/interrupts.c b/krnl386/interrupts.c
+index 1d83b99e..06c45195 100644
+--- a/krnl386/interrupts.c
++++ b/krnl386/interrupts.c
+@@ -627,7 +627,7 @@ FARPROC16 DOSVM_GetPMHandler16( BYTE intnum )
+     }
+     if (!DOSVM_Vectors16[intnum])
+     {
+-		if (!DOSVM_dpmi_segments) return NULL;
++		if (!DOSVM_dpmi_segments) return 0;
+         proc = (FARPROC16)MAKESEGPTR( DOSVM_dpmi_segments->int16_sel,
+                                                 DOSVM_STUB_PM16 * intnum );
+         DOSVM_Vectors16[intnum] = proc;
+diff --git a/krnl386/kernel.c b/krnl386/kernel.c
+index 09a9cba2..21398554 100644
+--- a/krnl386/kernel.c
++++ b/krnl386/kernel.c
+@@ -29,6 +29,7 @@
+ #include "wine/winuser16.h"
+ 
+ #include "kernel16_private.h"
++#include "dosexe.h"
+ #include "../toolhelp/toolhelp.h"
+ #include "wine/debug.h"
+ 
+@@ -997,7 +998,11 @@ FARPROC16 WINAPI ToolHelpHook16(FARPROC16 func)
+     static FARPROC16 hook;
+ 
+     FIXME("(%p), stub.\n", func);
++#ifdef _WIN64
++    return InterlockedExchange( (LONG *)&hook, func );
++#else
+     return InterlockedExchangePointer( (void **)&hook, func );
++#endif
+ }
+ 
+ /* thunk for 16-bit CreateThread */
+diff --git a/krnl386/ne_module.c b/krnl386/ne_module.c
+index 44304bc5..ed17b100 100644
+--- a/krnl386/ne_module.c
++++ b/krnl386/ne_module.c
+@@ -37,6 +37,7 @@
+ #include "windows/wownt32.h"
+ #include "winternl.h"
+ #include "kernel16_private.h"
++#include "dosexe.h"
+ #include "wine/exception.h"
+ #include "wine/debug.h"
+ #include "winuser.h"
+@@ -93,18 +94,45 @@ static inline void patch_code_segment( NE_MODULE *pModule )
+ 
+     call = GlobalLock16( pSeg->hSeg );
+ 
++#ifdef _WIN64
++    {
++        /* convspec stores image relative addresses on 64-bit hosts (see
++         * output_code16_pushl), add the base of the 32-bit module */
++        DWORD base = (DWORD)(ULONG_PTR)pModule->owner32;
++        BYTE *p, *end = (BYTE *)call + GlobalSize16( pSeg->hSeg );
++
++        if ((ULONG_PTR)pModule->owner32 >> 32)
++            ERR( "module %p is above 4GB, 16-bit entry points will not work\n", pModule->owner32 );
++        for (i = 0; call[i].pushl == 0x6866; i++) call[i].relay += base;
++        /* entry points: [pushw %bp] [stack prolog] pushl $target, callw callfrom16 */
++        p = (BYTE *)&call[i];
++        while (p + 10 <= end && p[0] == 0x55)
++        {
++            p++;
++            if (p[0] == 0x89) p += 8;  /* movw %sp,%bp; pushw $0x1234; popw %bp; popw %bp; pushw %bp */
++            if (p[0] != 0x66 || p[1] != 0x68) break;
++            *(DWORD *)(p + 2) += base;
++            p += 6;
++            if (p[0] != 0xe8) break;
++            p += 3;
++        }
++    }
++#endif
++
+     /* patch glue code address and code selector */
+     for (i = 0; call[i].pushl == 0x6866; i++)
+     {
+         if (call[i].ret[0] == 0xca || call[i].ret[0] == 0xcb)  /* register entry point? */
+-            call[i].glue = __wine_call_from_16_regs;
++            call[i].glue = (DWORD)(ULONG_PTR)__wine_call_from_16_regs;
+         else
+-            call[i].glue = __wine_call_from_16;
++            call[i].glue = (DWORD)(ULONG_PTR)__wine_call_from_16;
+         call[i].flatcs = wine_get_cs();
+     }
+ 
++#ifndef _WIN64  /* on 64-bit hosts relay_call_from_16 traces and calls the typed relays */
+     if (TRACE_ON(relay))  /* patch relay functions to all point to relay_call_from_16 */
+         for (i = 0; call[i].pushl == 0x6866; i++) call[i].relay = relay_call_from_16;
++#endif
+ }
+ 
+ 
+@@ -869,13 +897,13 @@ static BOOL NE_LoadDLLs( NE_MODULE *pModule )
+             {
+                 LPSTR buf = buffer + strlen(buffer);
+                 without_ext = TRUE;
+-                hDLL = MODULE_LoadModule16(buffer, TRUE, TRUE, NULL);
++                hDLL = MODULE_LoadModule16(buffer, TRUE, TRUE, 0);
+                 if (hDLL < 32)
+                 {
+                     HMODULE16 exe;
+                     buf[0] = 0;
+                     strcat(buffer, ".EXE");
+-                    exe = MODULE_LoadModule16(buffer, TRUE, TRUE, NULL);
++                    exe = MODULE_LoadModule16(buffer, TRUE, TRUE, 0);
+                     if (exe >= 32)
+                     {
+                         hDLL = exe;
+@@ -889,7 +917,7 @@ static BOOL NE_LoadDLLs( NE_MODULE *pModule )
+             }
+             else
+             {
+-                hDLL = MODULE_LoadModule16(buffer, TRUE, TRUE, NULL);
++                hDLL = MODULE_LoadModule16(buffer, TRUE, TRUE, 0);
+             }
+ 
+             if (hDLL < 32)
+@@ -1079,9 +1107,9 @@ static BOOL builtin_override(const char *lib)
+ {
+     const char list[][2][10] = {{"SCW", "TYPELIB"}};
+     char name[10] = {0};
+-    HANDLE task = GetCurrentTask();
++    HTASK16 task = GetCurrentTask();
+     if (!task) return FALSE;
+-    GetModuleName16(task, &name, sizeof(name));
++    GetModuleName16(task, name, sizeof(name));
+     for (int i = 0; i < ARRAY_SIZE(list); i++)
+     {
+         if (!strcmp(name, list[i][0]) && !strcmp(lib, list[i][1]))
+@@ -1293,7 +1321,7 @@ typedef struct tagLOADPARMS32 {
+ /**********************************************************************
+ *	    LoadModule    (KERNEL32.@)
+ */
+-HANDLE WINAPI LoadModule_wine_implementation(LPCSTR name, LPVOID paramBlock, HANDLE *result)
++DWORD WINAPI LoadModule_wine_implementation(LPCSTR name, LPVOID paramBlock, HANDLE *result)
+ {
+     LOADPARMS32 *params = paramBlock;
+     PROCESS_INFORMATION info;
+@@ -1363,7 +1391,7 @@ HANDLE WINAPI LoadModule_wine_implementation(LPCSTR name, LPVOID paramBlock, HAN
+                 *result = sei.hProcess;
+             else 
+                 ERR("ShellExecute Failed err = %u, %d\n", GetLastError(), sei.hInstApp);
+-            ret = sei.hInstApp;
++            ret = (DWORD)(ULONG_PTR)sei.hInstApp;
+         }
+         /**/
+     }
+@@ -1408,7 +1436,7 @@ HINSTANCE16 WINAPI LoadModule16( LPCSTR name, LPVOID paramBlock )
+     {
+         /* Main case: load first instance of NE module */
+         params = paramBlock;
+-        SEGPTR cmdline = IsBadReadPtr(params, 8) ? NULL : params->cmdLine;
++        SEGPTR cmdline = IsBadReadPtr(params, 8) ? 0 : params->cmdLine;
+         if ((hModule = MODULE_LoadModule16(name, FALSE, lib_only, cmdline)) < 32)
+         {
+             if (hModule == 21/* win32 */)
+@@ -1460,7 +1488,7 @@ HINSTANCE16 WINAPI LoadModule16( LPCSTR name, LPVOID paramBlock )
+     /* current directory */
+     if (params->hEnvironment == 0x0bef)
+     {
+-        curdir = (LPCSTR)params->reserved;
++        curdir = (LPCSTR)(ULONG_PTR)params->reserved;
+     }
+     return NE_CreateThread( pModule, cmdShow, cmdline, curdir);
+ }
+@@ -2071,7 +2099,7 @@ HINSTANCE16 WINAPI WinExec16(LPCSTR lpCmdLine, UINT16 nCmdShow)
+                 WIN32_GlobalUnlock16(curtask);
+                 break;
+             }
+-            TDB *lasttask = curtask;
++            HTASK16 lasttask = curtask;
+             curtask = curtdb->hNext;
+             WIN32_GlobalUnlock16(lasttask);
+         }
+@@ -2108,7 +2136,7 @@ FARPROC16 WINAPI GetProcAddress16( HMODULE16 hModule, LPCSTR name )
+         ordinal = LOWORD(name);
+         TRACE("%04x %04x\n", hModule, ordinal );
+     }
+-    if (!ordinal) return NULL;
++    if (!ordinal) return 0;
+ 
+     ret = NE_GetEntryPoint( hModule, ordinal );
+ 
+diff --git a/krnl386/ne_segment.c b/krnl386/ne_segment.c
+index 201b2ab3..dda05817 100644
+--- a/krnl386/ne_segment.c
++++ b/krnl386/ne_segment.c
+@@ -742,14 +742,14 @@ static BOOL NE_InitDLL( NE_MODULE *pModule, SEGPTR cmdline )
+     {
+         NFYSTARTDLL nf;
+         SEGPTR s = MapLS(&nf);
+-        SEGPTR save = getWOW32Reserved();
++        SEGPTR save = (SEGPTR)(ULONG_PTR)getWOW32Reserved();
+         nf.dwSize = sizeof(NFYSTARTDLL);
+         nf.hModule = pModule->self;
+         nf.wCS = context.SegCs;
+         nf.wIP = context.Eip;
+         TOOLHELP_CallNotify(NFY_STARTDLL, s);
+         UnMapLS(s);
+-        setWOW32Reserved(save);
++        setWOW32Reserved((PVOID)(ULONG_PTR)save);
+     }
+     pModule->ne_csip = 0;  /* Don't initialize it twice */
+     TRACE_(dll)("Calling LibMain for %.*s, cs:ip=%04x:%04x ds=%04x di=%04x cx=%04x\n",
+@@ -781,7 +781,7 @@ void NE_InitializeDLLs( HMODULE16 hModule, SEGPTR cmdline )
+ 	pModule->dlls_to_init = 0;
+         for (pDLL = GlobalLock16( to_init ); *pDLL; pDLL++)
+         {
+-            NE_InitializeDLLs( *pDLL, NULL );
++            NE_InitializeDLLs( *pDLL, 0 );
+         }
+         GlobalFree16( to_init );
+     }
+diff --git a/krnl386/relay.c b/krnl386/relay.c
+index b76d6f3b..d36988d3 100644
+--- a/krnl386/relay.c
++++ b/krnl386/relay.c
+@@ -325,7 +325,41 @@ static const CALLFROM16 *get_entry_point( STACK16FRAME *frame, LPSTR module, LPS
+     /* p now points to lret, get the start of CALLFROM16 structure */
+     return (CALLFROM16 *)(p - FIELD_OFFSET( CALLFROM16, ret ));
+ }
+-#ifdef _MSC_VER
++#if defined(__aarch64__)
++/* Call 'func' with integer/pointer arguments (no floating point).  Extra
++ * arguments are harmless with the ARM64 calling convention. */
++ULONG_PTR call_entry_point64( void *func, int nb_args, const ULONG_PTR *args )
++{
++    typedef ULONG_PTR (WINAPI *func32_t)( ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
++                                          ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
++                                          ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR,
++                                          ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR );
++    ULONG_PTR a[32] = { 0 };
++
++    if (nb_args > 32)
++    {
++        ERR( "too many arguments (%d) for %p\n", nb_args, func );
++        nb_args = 32;
++    }
++    if (nb_args > 0) memcpy( a, args, nb_args * sizeof(a[0]) );
++    return ((func32_t)func)( a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
++                             a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15],
++                             a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23],
++                             a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31] );
++}
++
++/* 32-bit arguments are sign extended (LONG, handles such as (HANDLE)-1);
++ * flat pointers passed this way must be below 2GB. */
++int call_entry_point( void *func, int nb_args, const int *args )
++{
++    ULONG_PTR a[32];
++    int i;
++
++    if (nb_args > 32) nb_args = 32;
++    for (i = 0; i < nb_args; i++) a[i] = (ULONG_PTR)(LONG_PTR)args[i];
++    return (int)call_entry_point64( func, nb_args, a );
++}
++#elif defined(_MSC_VER)
+ extern int call_entry_point(void *func, int nb_args, const int *args)
+ {
+ 	//ERR("call_entry_point(%p, %d, %p)", func, nb_args, args);
+@@ -388,6 +422,7 @@ __ASM_GLOBAL_FUNC( _call_entry_point,
+                    "ret" )
+ #endif
+ 
++#ifndef __aarch64__
+ /***********************************************************************
+  *           relay_call_from_16_no_debug
+  *
+@@ -480,6 +515,7 @@ static int relay_call_from_16_no_debug( void *entry_point, unsigned char *args16
+ 
+     return call_entry_point( entry_point, nb_args, args32 );
+ }
++#endif /* __aarch64__ */
+ 
+ 
+ __declspec(dllexport) void vm_debug_get_entry_point(char *module, char *func, WORD *ordinal, STACK16FRAME *frame)
+@@ -490,6 +526,123 @@ __declspec(dllexport) void vm_debug_get_entry_point(char *module, char *func, WO
+     const CALLFROM16 *call;
+     call = get_entry_point(frame, module, func, ordinal);
+ }
++#ifdef __aarch64__
++/***********************************************************************
++ *           relay_get_args64
++ *
++ * Build the native arguments of a 16-bit entry point from the argument
++ * types of its CALLFROM16 structure.  Returns the number of arguments.
++ */
++static int relay_get_args64( const CALLFROM16 *call, unsigned char *args16, CONTEXT86 *context, ULONG_PTR *args64 )
++{
++    unsigned int i, j, nb_args = 0;
++
++    /* look for the ret instruction */
++    for (j = 0; j < ARRAY_SIZE(call->ret); j++)
++        if (call->ret[j] == 0xca || call->ret[j] == 0xcb) break;
++
++    if (call->ret[j] == 0xcb)  /* cdecl */
++    {
++        for (i = 0; i < 20; i++, nb_args++)
++        {
++            int type = (call->arg_types[i / 10] >> (3 * (i % 10))) & 7;
++
++            if (type == ARG_NONE) break;
++            switch(type)
++            {
++            case ARG_WORD:   args64[nb_args] = *(WORD *)args16; args16 += sizeof(WORD); break;
++            case ARG_SWORD:  args64[nb_args] = (ULONG_PTR)(LONG_PTR)*(short *)args16; args16 += sizeof(WORD); break;
++            case ARG_LONG:   args64[nb_args] = (ULONG_PTR)(LONG_PTR)*(LONG *)args16; args16 += sizeof(LONG); break;
++            case ARG_SEGSTR: args64[nb_args] = *(DWORD *)args16; args16 += sizeof(DWORD); break;
++            case ARG_PTR:
++            case ARG_STR:    args64[nb_args] = (ULONG_PTR)MapSL( *(SEGPTR *)args16 ); args16 += sizeof(SEGPTR); break;
++            case ARG_VARARG: args64[nb_args] = (ULONG_PTR)args16; break;
++            default: break;
++            }
++        }
++    }
++    else  /* pascal: start with the last arg */
++    {
++        args16 += call->ret[j + 1];
++        for (i = 0; i < 20; i++, nb_args++)
++        {
++            int type = (call->arg_types[i / 10] >> (3 * (i % 10))) & 7;
++
++            if (type == ARG_NONE) break;
++            switch(type)
++            {
++            case ARG_WORD:   args16 -= sizeof(WORD); args64[nb_args] = *(WORD *)args16; break;
++            case ARG_SWORD:  args16 -= sizeof(WORD); args64[nb_args] = (ULONG_PTR)(LONG_PTR)*(short *)args16; break;
++            case ARG_LONG:   args16 -= sizeof(LONG); args64[nb_args] = (ULONG_PTR)(LONG_PTR)*(LONG *)args16; break;
++            case ARG_SEGSTR: args16 -= sizeof(DWORD); args64[nb_args] = *(DWORD *)args16; break;
++            case ARG_PTR:
++            case ARG_STR:    args16 -= sizeof(SEGPTR); args64[nb_args] = (ULONG_PTR)MapSL( *(SEGPTR *)args16 ); break;
++            default: break;
++            }
++        }
++    }
++    if (!j)  /* register function */
++        args64[nb_args++] = (ULONG_PTR)context;
++    return nb_args;
++}
++
++/***********************************************************************
++ *           relay_call_from_16  (ARM64)
++ *
++ * Called by the vm86 emulator for every 16->32 call.  Entry points of
++ * the built-in modules have a typed relay function generated by convspec
++ * (it knows about 64-bit integers and floating point arguments); thunks
++ * built at run time use relay_call_from_16 itself as relay, and their
++ * arguments are converted from the argument types of the CALLFROM16.
++ */
++int relay_call_from_16( void *entry_point, unsigned char *args16, CONTEXT86 *context )
++{
++    STACK16FRAME *frame = CURRENT_STACK16;
++    const CALLFROM16 *call = NULL;
++    char module[10], func[64];
++    WORD ordinal = 0;
++    BOOL trace = FALSE;
++    int ret;
++
++    if (TRACE_ON(relay))
++    {
++        call = get_entry_point( frame, module, func, &ordinal );
++        trace = call && RELAY_ShowDebugmsgRelay( module, ordinal, func );
++        if (trace)
++            DPRINTF( "%04x:Call %s.%d: %s() ret=%04x:%04x ds=%04x\n", GetCurrentThreadId(),
++                     module, ordinal, func, frame->cs, frame->ip, frame->ds );
++    }
++
++    SYSLEVEL_CheckNotLevel( 2 );
++    if (frame->relay != (DWORD)(ULONG_PTR)relay_call_from_16)
++    {
++        ret = ((int (*)( void *, unsigned char *, CONTEXT86 * ))(ULONG_PTR)frame->relay)( entry_point, args16, context );
++    }
++    else
++    {
++        ULONG_PTR args64[21];
++        int nb_args;
++
++        if (!call) call = get_entry_point( frame, module, func, &ordinal );
++        if (!call)
++        {
++            ERR( "no entry point information for %04x:%04x\n", frame->module_cs, frame->entry_ip );
++            return 0;
++        }
++        nb_args = relay_get_args64( call, args16, context, args64 );
++        ret = (int)call_entry_point64( entry_point, nb_args, args64 );
++    }
++    SYSLEVEL_CheckNotLevel( 2 );
++
++    if (trace)
++    {
++        frame = CURRENT_STACK16;  /* might have be changed by the entry point */
++        DPRINTF( "%04x:Ret  %s.%d: %s() retval=%08x ret=%04x:%04x ds=%04x\n", GetCurrentThreadId(),
++                 module, ordinal, func, ret, frame->cs, frame->ip, frame->ds );
++    }
++    return ret;
++}
++#else /* __aarch64__ */
+ /***********************************************************************
+  *           relay_call_from_16
+  *
+@@ -667,6 +820,7 @@ int relay_call_from_16( void *entry_point, unsigned char *args16, CONTEXT86 *con
+     }
+     return ret_val;
+ }
++#endif /* __aarch64__ */
+ 
+ /**********************************************************************
+  *          RELAY_GetPointer
+@@ -919,6 +1073,11 @@ SEGPTR make_thunk_32(void *funcptr, const char *arguments, const char *name, BOO
+         relay->call = ret_pascal_32bit_template;
+     }
+     init_arg_types(&relay->call.arg_types, arguments, &arg_size);
++#ifdef _WIN64
++    /* use the generic argument conversion of relay_call_from_16, the
++     * template's relay function is typed for another entry point */
++    relay->call.relay = (DWORD)(ULONG_PTR)relay_call_from_16;
++#endif
+     if (!is_cdecl)
+     {
+         int i;
+diff --git a/krnl386/resource.c b/krnl386/resource.c
+index 65b0ff79..14eddf29 100644
+--- a/krnl386/resource.c
++++ b/krnl386/resource.c
+@@ -373,10 +373,10 @@ FARPROC16 WINAPI SetResourceHandler16( HMODULE16 hModule, LPCSTR typeId, FARPROC
+ {
+     LPBYTE pResTab;
+     NE_TYPEINFO *pTypeInfo;
+-    FARPROC16 prevHandler = NULL;
++    FARPROC16 prevHandler = 0;
+     NE_MODULE *pModule = NE_GetPtr( hModule );
+ 
+-    if (!pModule || !pModule->ne_rsrctab) return NULL;
++    if (!pModule || !pModule->ne_rsrctab) return 0;
+ 
+     pResTab = (LPBYTE)pModule + pModule->ne_rsrctab;
+     pTypeInfo = (NE_TYPEINFO *)(pResTab + 2);
+@@ -1254,7 +1254,7 @@ __declspec(dllexport) HICON NE_ExtractIcon(LPCSTR lpszExeFileName,
+ 	if ((dwSearchReturn == 0) || (dwSearchReturn > sizeof(szExePath) / sizeof(szExePath[0])))
+ 	{
+ 		WARN("File %s not found or path too long\n", debugstr_a(lpszExeFileName));
+-		return -1;
++		return (HICON)(LONG_PTR)-1;
+ 	}
+ 	hFile = CreateFileA(szExePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, 0);
+ 	if (hFile == INVALID_HANDLE_VALUE) return 0;
+@@ -1266,14 +1266,14 @@ __declspec(dllexport) HICON NE_ExtractIcon(LPCSTR lpszExeFileName,
+ 	if (!fmapping)
+ 	{
+ 		WARN("CreateFileMapping error %d\n", GetLastError());
+-		return 0xFFFFFFFF;
++		return (HICON)(ULONG_PTR)0xFFFFFFFF;
+ 	}
+ 
+ 	if (!(image = MapViewOfFile(fmapping, FILE_MAP_READ, 0, 0, 0)))
+ 	{
+ 		WARN("MapViewOfFile error %d\n", GetLastError());
+ 		CloseHandle(fmapping);
+-		return 0xFFFFFFFF;
++		return (HICON)(ULONG_PTR)0xFFFFFFFF;
+ 	}
+ 	CloseHandle(fmapping);
+ 	cx1 = LOWORD(cxDesired);
+@@ -1393,7 +1393,7 @@ __declspec(dllexport) HICON NE_ExtractIcon(LPCSTR lpszExeFileName,
+ 	}
+ 	end:
+ 	UnmapViewOfFile(image);	/* success */
+-	return ret;
++	return (HICON)(ULONG_PTR)ret;
+ }
+ 
+ 
+diff --git a/krnl386/selector.c b/krnl386/selector.c
+index e8048611..161f5d9c 100644
+--- a/krnl386/selector.c
++++ b/krnl386/selector.c
+@@ -83,7 +83,7 @@ WORD WINAPI AllocSelector16( WORD sel )
+     for (i = 0; i < count; i++)
+     {
+         wine_ldt_set_limit(&nentry, wine_ldt_get_limit(&entry) - (0x10000 * i));
+-        wine_ldt_set_base(&nentry, (DWORD)wine_ldt_get_base(&entry) + (0x10000 * i));
++        wine_ldt_set_base(&nentry, (char *)wine_ldt_get_base(&entry) + (0x10000 * i));
+         wine_ldt_set_entry(newsel + (i << __AHSHIFT), &nentry);
+     }
+     return newsel;
+@@ -492,7 +492,7 @@ SEGPTR WINAPI MapLS( LPCVOID ptr )
+             first_entry = free;
+         }
+         wine_ldt_get_entry(free->sel, &ldt);
+-        wine_ldt_set_base(&ldt, (DWORD)base);
++        wine_ldt_set_base(&ldt, (const void *)(ULONG_PTR)base);
+         wine_ldt_set_entry(free->sel, &ldt);
+         free->addr = (void*)base;
+         entry = free;
+@@ -532,7 +532,7 @@ void WINAPI UnMapLS( SEGPTR sptr )
+  */
+ LPVOID WINAPI MapSL( SEGPTR sptr )
+ {
+-    if (!(SELECTOROF(sptr) & 4)) return OFFSETOF(sptr);
++    if (!(SELECTOROF(sptr) & 4)) return (LPVOID)(ULONG_PTR)OFFSETOF(sptr);
+     return (char *)wine_ldt_copy.base[SELECTOROF(sptr) >> __AHSHIFT] + OFFSETOF(sptr);
+ }
+ 
+diff --git a/krnl386/snoop.c b/krnl386/snoop.c
+index 07bccd0a..3f9e7f2a 100644
+--- a/krnl386/snoop.c
++++ b/krnl386/snoop.c
+@@ -346,5 +346,5 @@ static void WINAPI SNOOP16_Return(FARPROC proc, LPBYTE args, CONTEXT86 *context)
+         DPRINTF(") retval = %04x:%04x ret=%04x:%04x\n",
+                 (WORD)context->Edx,(WORD)context->Eax,
+                 HIWORD(ret->origreturn),LOWORD(ret->origreturn));
+-	ret->origreturn = NULL; /* mark as empty */
++	ret->origreturn = 0; /* mark as empty */
+ }
+diff --git a/krnl386/stub.c b/krnl386/stub.c
+index cb0d9f7f..eb25c986 100644
+--- a/krnl386/stub.c
++++ b/krnl386/stub.c
+@@ -37,7 +37,7 @@ typedef struct tagRMCB {
+     DWORD regs_ofs, regs_sel;
+     struct tagRMCB *next;
+ } RMCB;
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) || !defined(__i386__)
+ void DPMI_CallRMCB32(RMCB *rmcb, UINT16 ss, DWORD esp, UINT16*es, DWORD*edi)
+ {
+     ERR("NOTIMPL:DPMI_CallRMCB32(%p, %u, %u, %p, %p)\n", rmcb, ss, esp, es, edi);
+@@ -155,7 +155,7 @@ void WINAPI wine_call_to_16_regs(CONTEXT86 *context, DWORD cbArgs, PEXCEPTION_HA
+ }
+ void __wine_enter_vm86(CONTEXT86 *context)
+ {
+-    func_wine_call_to_16_regs_vm86(context, NULL, NULL, __wine_call_from_16_regs, __wine_call_from_16, relay_call_from_16, __wine_call_to_16_ret_p, get_debug_mode(), TRUE, DOSMEM_dosmem, wine_pm_interrupt_handler);
++    func_wine_call_to_16_regs_vm86(context, 0, 0, __wine_call_from_16_regs, __wine_call_from_16, relay_call_from_16, __wine_call_to_16_ret_p, get_debug_mode(), TRUE, DOSMEM_dosmem, wine_pm_interrupt_handler);
+ }
+ BOOL16 WINAPI IsDBCSLeadByte16(BYTE TestChar)
+ {
+@@ -171,7 +171,7 @@ __declspec(dllexport) PVOID getWOW32Reserved()
+ }
+ __declspec(dllexport) PVOID setWOW32Reserved(PVOID w)
+ {
+-    return TebTlsSetValue(NtCurrentTeb(), WOW32ReservedTls, w);
++    return (PVOID)(ULONG_PTR)TebTlsSetValue(NtCurrentTeb(), WOW32ReservedTls, w);
+ }
+ 
+ __declspec(thread) WINE_VM86_TEB_INFO GdiTebBatch;
+diff --git a/krnl386/syslevel.c b/krnl386/syslevel.c
+index eeadf8d6..c694218e 100644
+--- a/krnl386/syslevel.c
++++ b/krnl386/syslevel.c
+@@ -40,7 +40,7 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &Win16Mutex.crst,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": Win16Mutex") }
++      0, 0, { 0 }
+ };
+ static SYSLEVEL Win16Mutex = { { &critsect_debug, -1, 0, 0, 0, 0 }, 1 };
+ 
+diff --git a/krnl386/task.c b/krnl386/task.c
+index 7ac8ccc7..9be6a9b8 100644
+--- a/krnl386/task.c
++++ b/krnl386/task.c
+@@ -150,7 +150,7 @@ LPVOID WINAPI TebTlsGetValue(TEB *teb, DWORD index)
+ }
+ static DWORD curdir_tls_index = -1;
+ 
+-static HTASK16 task_old = NULL;
++static HTASK16 task_old = 0;
+ static struct kernel_thread_data *task_old_data = NULL;
+ /***********************************************************************
+  *	     TASK_InstallTHHook
+@@ -423,7 +423,11 @@ static TDB *TASK_Create( NE_MODULE *pModule, UINT16 cmdShow, LPCSTR cmdline, BYT
+     /* Create scheduler event for 16-bit tasks */
+ 
+     if ( !(pTask->flags & TDBF_WIN32) )
+-        NtCreateEvent( &pTask->hEvent, EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE );
++    {
++        HANDLE event;
++        NtCreateEvent( &event, EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE );
++        SET_TDB_EVENT( pTask, event );
++    }
+ 
+     if (!initial_task) initial_task = hTask;
+ 
+@@ -445,7 +449,7 @@ static void TASK_DeleteTask( HTASK16 hTask )
+     {
+         task_old = 0;
+         task_old_data = NULL;
+-        TlsSetValue(curdir_tls_index, 0xdead);
++        TlsSetValue(curdir_tls_index, (LPVOID)0xdead);
+     }
+     hPDB = pTask->hPDB;
+ 
+@@ -899,7 +903,7 @@ void WINAPI InitTask16( CONTEXT86 *context )
+         LocalInit16( GlobalHandleToSel16(pTask->hInstance), 0, LOWORD(context->Ecx) );
+ 
+     /* Initialize implicitly loaded DLLs */
+-    NE_InitializeDLLs( pTask->hModule, NULL );
++    NE_InitializeDLLs( pTask->hModule, 0 );
+     NE_DllProcessAttach( pTask->hModule );
+ 
+     /* Registers on return are:
+@@ -959,10 +963,10 @@ BOOL16 WINAPI WaitEvent16( HTASK16 hTask )
+     {
+         DWORD lockCount;
+ 
+-        NtResetEvent( pTask->hEvent, NULL );
++        NtResetEvent( TDB_EVENT(pTask), NULL );
+         ReleaseThunkLock( &lockCount );
+         SYSLEVEL_CheckNotLevel( 1 );
+-        WaitForSingleObject( pTask->hEvent, INFINITE );
++        WaitForSingleObject( TDB_EVENT(pTask), INFINITE );
+         RestoreThunkLock( lockCount );
+         if (pTask->nEvents > 0) pTask->nEvents--;
+     }
+@@ -990,7 +994,7 @@ void WINAPI PostEvent16( HTASK16 hTask )
+ 
+     pTask->nEvents++;
+ 
+-    if (pTask->nEvents == 1) NtSetEvent( pTask->hEvent, NULL );
++    if (pTask->nEvents == 1) NtSetEvent( TDB_EVENT(pTask), NULL );
+ }
+ 
+ 
+@@ -1067,9 +1071,9 @@ void WINAPI DirectedYield16( HTASK16 hTask )
+     TDB *tdb = TASK_GetPtr(hTask);
+     DWORD count;
+     struct kernel_thread_data *chdthd;
+-    HTASK task;
++    HTASK16 task;
+     BOOL failed = FALSE;
+-    HTASK current = GetCurrentTask();
++    HTASK16 current = GetCurrentTask();
+     if (!tdb->teb)
+     {
+         OldYield16();
+@@ -1208,7 +1212,7 @@ FARPROC16 WINAPI MakeProcInstance16( FARPROC16 func, HANDLE16 hInstance )
+     if (!HIWORD(func)) {
+       /* Win95 actually protects via SEH, but this is better for debugging */
+       WARN("Ouch ! Called with invalid func %p !\n", func);
+-      return NULL;
++      return 0;
+     }
+ 
+     if ( (GlobalHandleToSel16(CURRENT_DS) != hInstanceSelector)
+@@ -1232,7 +1236,7 @@ FARPROC16 WINAPI MakeProcInstance16( FARPROC16 func, HANDLE16 hInstance )
+ 	return func;
+ 
+     thunkaddr = TASK_AllocThunk();
+-    if (!thunkaddr) return NULL;
++    if (!thunkaddr) return 0;
+     thunk = MapSL( thunkaddr );
+     lfunc = MapSL( (SEGPTR)func );
+ 
+@@ -1731,7 +1735,7 @@ FARPROC16 WINAPI SetTaskSignalProc( HTASK16 hTask, FARPROC16 proc )
+     FARPROC16 oldProc;
+ 
+     if (!hTask) hTask = GetCurrentTask();
+-    if (!(pTask = TASK_GetPtr( hTask ))) return NULL;
++    if (!(pTask = TASK_GetPtr( hTask ))) return 0;
+     oldProc = pTask->userhandler;
+     pTask->userhandler = proc;
+     return oldProc;
+@@ -1747,7 +1751,7 @@ WORD WINAPI SetSigHandler16( FARPROC16 newhandler, FARPROC16* oldhandler,
+ 	  newhandler,oldhandler,oldmode,newmode,flag );
+ 
+     if (flag != 1) return 0;
+-    if (!newmode) newhandler = NULL;  /* Default handler */
++    if (!newmode) newhandler = 0;  /* Default handler */
+     if (newmode != 4)
+     {
+         TDB *pTask;
+@@ -2154,13 +2158,13 @@ void switch_directory(struct kernel_thread_data *thread_data)
+         }
+         if (TlsGetValue(curdir_tls_index) == 0xdead)
+         {
+-            task_old = NULL;
++            task_old = 0;
+             task_old_data = NULL;
+             return;
+         }
+         if (!task_old || !task_old_data || !task_old_data->curdir_buf)
+         {
+-            task_old = NULL;
++            task_old = 0;
+             task_old_data = NULL;
+         }
+         if (task_old)
+diff --git a/krnl386/thunk.c b/krnl386/thunk.c
+index c80fd1d4..18f51bc1 100644
+--- a/krnl386/thunk.c
++++ b/krnl386/thunk.c
+@@ -1258,7 +1258,7 @@ void WINAPI __regs_K32Thk1632Prolog( CONTEXT86 *context )
+             context->Ebp, context->Esp, getWOW32Reserved());
+ 
+       memset(frame16, '\0', sizeof(STACK16FRAME));
+-      frame16->frame32 = frame32;
++      SET_STACK16_FRAME32(frame16, frame32);
+       frame16->ebp = context->Ebp;
+ 
+       memcpy(stack32, stack16, argSize);
+@@ -1294,14 +1294,14 @@ void WINAPI __regs_K32Thk1632Epilog( CONTEXT86 *context )
+       STACK16FRAME *frame16 = MapSL((SEGPTR)getWOW32Reserved());
+       char *stack16 = (char *)(frame16 + 1);
+       DWORD argSize = frame16->ebp - (DWORD)stack16;
+-      char *stack32 = (char *)frame16->frame32 - argSize;
++      char *stack32 = (char *)STACK16_FRAME32(frame16) - argSize;
+ 
+       DWORD nArgsPopped = context->Esp - (DWORD)stack32;
+ 
+       TRACE("before SYSTHUNK hack: EBP: %08x ESP: %08x cur_stack: %p\n",
+             context->Ebp, context->Esp, getWOW32Reserved());
+ 
+-      setWOW32Reserved(frame16->frame32);
++      setWOW32Reserved(STACK16_FRAME32(frame16));
+ 
+       context->Esp = (DWORD)stack16 + nArgsPopped;
+       context->Ebp = frame16->ebp;
+@@ -2340,7 +2340,7 @@ void WINAPI Throw16( LPCATCHBUF lpbuf, INT16 retval, CONTEXT86 *context )
+ 
+     /* Find the frame32 corresponding to the frame16 we are jumping to */
+     pFrame = CURRENT_STACK16;
+-    frame32 = pFrame->frame32;
++    frame32 = STACK16_FRAME32(pFrame);
+     while (frame32 && frame32->frame16)
+     {
+         if (SELECTOROF(frame32->frame16) != SELECTOROF(getWOW32Reserved()))
+@@ -2356,10 +2356,10 @@ void WINAPI Throw16( LPCATCHBUF lpbuf, INT16 retval, CONTEXT86 *context )
+         if (OFFSETOF(frame32->frame16) > lpbuf[2])
+         {
+             /* We found the right frame */
+-            pFrame->frame32 = frame32;
++            SET_STACK16_FRAME32(pFrame, frame32);
+             break;
+         }
+-        frame32 = (pFramePrev = (STACK16FRAME *)MapSL(frame32->frame16))->frame32;
++        frame32 = STACK16_FRAME32(pFramePrev = (STACK16FRAME *)MapSL(frame32->frame16));
+     }
+     if (pFramePrev)
+         memmove(pFramePrev, pFrame, sizeof(STACK16FRAME));
+@@ -2398,7 +2398,7 @@ void WINAPI Throw16( LPCATCHBUF lpbuf, INT16 retval, CONTEXT86 *context )
+         pop edi
+     }
+ #else
+-    RtlUnwind(&pFrame->frame32->frame, NULL, NULL, 0);
++    RtlUnwind(&STACK16_FRAME32(pFrame)->frame, NULL, NULL, 0);
+ #endif
+     RemoveVectoredExceptionHandler(v);
+     SetUnhandledExceptionFilter(old_filter);
+@@ -2502,9 +2502,9 @@ static DWORD WOW_CallProc32W16( FARPROC proc32, DWORD nrofargs, DWORD *args )
+     DWORD mutex_count;
+ 
+     if ((proc32 == DSI_InitializeDirectSound) || (proc32 == DSI_InitializeSound) || (proc32 == USER32_SetScrollInfo))
+-        args[0] = HWND_32(args[0]);
++        args[0] = HandleToULong(HWND_32(args[0]));
+     else if (proc32 == WSOCK32_WSAAsyncSelect)
+-        args[1] = HWND_32(args[1]);
++        args[1] = HandleToULong(HWND_32(args[1]));
+ 
+     ReleaseThunkLock( &mutex_count );
+     if (!proc32) ret = 0;
+diff --git a/krnl386/utthunk.c b/krnl386/utthunk.c
+index ca68f225..e4815cc5 100644
+--- a/krnl386/utthunk.c
++++ b/krnl386/utthunk.c
+@@ -163,7 +163,7 @@ static DWORD WINAPI UTGlue32( FARPROC16 target, LPVOID lpBuff, DWORD dwUserDefin
+ static UTINFO *UTAlloc( HMODULE hModule, HMODULE16 hModule16,
+                         FARPROC16 target16, FARPROC target32 )
+ {
+-    static FARPROC16 UTGlue16_Segptr = NULL;
++    static FARPROC16 UTGlue16_Segptr = 0;
+     UTINFO *ut;
+ 
+     if ( !UTGlue16_Segptr )
+diff --git a/krnl386/vga.c b/krnl386/vga.c
+index 368d6310..e815b098 100644
+--- a/krnl386/vga.c
++++ b/krnl386/vga.c
+@@ -223,7 +223,7 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &vga_lock,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": vga_lock") }
++      0, 0, { 0 }
+ };
+ static CRITICAL_SECTION vga_lock = { &critsect_debug, -1, 0, 0, 0, 0 };
+ 
+@@ -710,7 +710,7 @@ static void VGA_InstallTimer(unsigned Rate)
+     {
+         VGA_timer = CreateWaitableTimerA( NULL, FALSE, NULL );
+         /* Occasionally calling QueueUserAPC immediately after creating a thread will fail */
+-        VGA_timer_thread = CreateThread( NULL, 0, VGA_TimerThread, (ULONG_PTR)Rate, 0, NULL );
++        VGA_timer_thread = CreateThread( NULL, 0, VGA_TimerThread, (LPVOID)(ULONG_PTR)Rate, 0, NULL );
+     }
+     else
+     {
+@@ -1925,7 +1925,7 @@ static DWORD WINAPI init_vga_window()
+         return 0;
+     wc.style = CS_HREDRAW | CS_VREDRAW | CS_NOCLOSE | CS_OWNDC;
+     wc.lpfnWndProc = VGA_WindowProc;
+-    wc.hbrBackground = COLOR_WINDOW + 1;
++    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+     wc.hInstance = GetModuleHandleA(NULL);
+     wc.lpszClassName = "VGA";
+diff --git a/krnl386/vxd.c b/krnl386/vxd.c
+index e228c5df..fd806aae 100644
+--- a/krnl386/vxd.c
++++ b/krnl386/vxd.c
+@@ -98,7 +98,7 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &vxd_section,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
+-      0, 0, { (DWORD_PTR)(__FILE__ ": vxd_section") }
++      0, 0, { 0 }
+ };
+ static CRITICAL_SECTION vxd_section = { &critsect_debug, -1, 0, 0, 0, 0 };
+ 
+diff --git a/krnl386/wow_handle.c b/krnl386/wow_handle.c
+index 79f3ce2c..9dfe131c 100644
+--- a/krnl386/wow_handle.c
++++ b/krnl386/wow_handle.c
+@@ -115,7 +115,7 @@ WORD get_handle16(HANDLE h, HANDLE_STORAGE *hs, WOW_HANDLE_TYPE type)
+ {
+ 	if (is_reserved_handle32(h))
+ 	{
+-		return h;
++		return (WORD)(ULONG_PTR)h;
+ 	}
+ 	HANDLE_DATA *hd;
+ 	int hnd16 = get_handle16_data(h, hs, &hd);
+@@ -132,7 +132,7 @@ WORD get_handle16_data(HANDLE h, HANDLE_STORAGE *hs, HANDLE_DATA **o)
+ 	if (is_reserved_handle32(h))
+ 	{
+ 		*o = &hs->handles[(size_t)h];
+-		return h;
++		return (WORD)(ULONG_PTR)h;
+ 	}
+ 	WORD fhandle = 0;
+     DWORD type = get_handle_type(h, hs);
+@@ -175,13 +175,13 @@ retry:
+ }
+ void destroy_handle16(HANDLE_STORAGE *hs, WORD h)
+ {
+-    if (is_reserved_handle32(h))
++    if (is_reserved_handle32((HANDLE)(ULONG_PTR)h))
+     {
+         return;
+     }
+     DWORD type = get_handle_type(hs->handles[h].handle32, hs);
+     memset(hs->handles + h, 0, sizeof(*hs->handles));
+-    hs->handles[h].handle32 = type;
++    hs->handles[h].handle32 = (HANDLE)(ULONG_PTR)type;
+ }
+ BOOL get_handle32_data(WORD h, HANDLE_STORAGE *hs, HANDLE_DATA **o)
+ {
+@@ -193,7 +193,7 @@ BOOL get_handle32_data(WORD h, HANDLE_STORAGE *hs, HANDLE_DATA **o)
+     if (is_reserved_handle16(h))
+ 	{
+ 		*o = &hs->handles[(size_t)h];
+-		(*o)->handle32 = h;
++		(*o)->handle32 = (HANDLE)(ULONG_PTR)h;
+ 		return TRUE;
+ 	}
+ 	*o = &hs->handles[h];
+@@ -203,15 +203,15 @@ HANDLE get_handle32(WORD h, HANDLE_STORAGE *hs)
+ {
+ 	if (is_reserved_handle16(h))
+ 	{
+-        hs->handles[h].handle32 = h;
+-		return (UINT16)h;
++        hs->handles[h].handle32 = (HANDLE)(ULONG_PTR)h;
++		return (HANDLE)(ULONG_PTR)(UINT16)h;
+ 	}
+     if (hs->handles[h].handle32)
+     {
+         return hs->handles[h].handle32;
+     }
+-    hs->handles[h].handle32 = h;
+-    return (HANDLE)h;
++    hs->handles[h].handle32 = (HANDLE)(ULONG_PTR)h;
++    return (HANDLE)(ULONG_PTR)h;
+ }
+ 
+ static void enter_handle_lock()
+diff --git a/krnl386/wowthunk.c b/krnl386/wowthunk.c
+index aa0b0def..473c0066 100644
+--- a/krnl386/wowthunk.c
++++ b/krnl386/wowthunk.c
+@@ -337,7 +337,7 @@ struct _CONTEXT **ContextRecord,
+ /**********************************************************************
+  *           K32WOWGetDescriptor        (KERNEL32.70)
+  */
+-BOOL WINAPI K32WOWGetDescriptor( SEGPTR segptr, LPLDT_ENTRY ldtent )
++BOOL WINAPI K32WOWGetDescriptor( SEGPTR segptr, LDT_ENTRY * ldtent )
+ {
+     return GetThreadSelectorEntry( GetCurrentThread(),
+                                    segptr >> 16, ldtent );
+diff --git a/otvdm/winevdm.c b/otvdm/winevdm.c
+index 670079d8..7cec6bc3 100644
+--- a/otvdm/winevdm.c
++++ b/otvdm/winevdm.c
+@@ -475,10 +475,10 @@ static BOOL fix_compatible(void)
+     if (NT_SUCCESS(NtQueryInformationProcess(proc_inf.hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), NULL)))
+     {
+         ULARGE_INTEGER AppCompatFlagsUser;
+-        if (ReadProcessMemory(proc_inf.hProcess, (ULONG_PTR)pbi.PebBaseAddress + offsetof(PEB2, AppCompatFlagsUser), &AppCompatFlagsUser, sizeof(AppCompatFlagsUser), NULL))
++        if (ReadProcessMemory(proc_inf.hProcess, (LPCVOID)((ULONG_PTR)pbi.PebBaseAddress + offsetof(PEB2, AppCompatFlagsUser)), &AppCompatFlagsUser, sizeof(AppCompatFlagsUser), NULL))
+         {
+             AppCompatFlagsUser.LowPart |= NoPaddedBorder;
+-            WriteProcessMemory(proc_inf.hProcess, (ULONG_PTR)pbi.PebBaseAddress + offsetof(PEB2, AppCompatFlagsUser), &AppCompatFlagsUser, sizeof(AppCompatFlagsUser), NULL);
++            WriteProcessMemory(proc_inf.hProcess, (LPVOID)((ULONG_PTR)pbi.PebBaseAddress + offsetof(PEB2, AppCompatFlagsUser)), &AppCompatFlagsUser, sizeof(AppCompatFlagsUser), NULL);
+         }
+     }
+     ResumeThread(proc_inf.hThread);
+@@ -567,7 +567,7 @@ DWORD exec16_thread(LPVOID args)
+     if (exec_data.header == SHARED_WOW_CURDIR_SUPPORTED)
+     {
+         params.hEnvironment = 0x0bef;
+-        params.reserved = &exec_data.curdir;
++        params.reserved = (SEGPTR)(ULONG_PTR)&exec_data.curdir;  /* flat pointer, see NE_LoadModule */
+     }
+     showCmd[0] = 2;
+     showCmd[1] = SW_SHOW;
+@@ -799,7 +799,7 @@ int entry_point( int argc, char *argv[] )
+             for (int i = 0; i < argc; i++)
+             {
+                 int length = WideCharToMultiByte(CP_ACP, 0, argvw[i], -1, NULL, 0, NULL, NULL);
+-                LPSTR arg = HeapAlloc(GetProcessHeap(), NULL, (length + 1) * sizeof(CHAR));
++                LPSTR arg = HeapAlloc(GetProcessHeap(), 0, (length + 1) * sizeof(CHAR));
+                 WideCharToMultiByte(CP_ACP, 0, argvw[i], -1, arg, length, NULL, NULL);
+                 arg[length] = '\0';
+                 argv_copy[i] = arg;
+diff --git a/vm86/msdos.cpp b/vm86/msdos.cpp
+index 9017e9d0..ed1b2eb3 100644
+--- a/vm86/msdos.cpp
++++ b/vm86/msdos.cpp
+@@ -6,6 +6,7 @@
+ */
+ int ignore_illegal_insn;
+ #include "msdos.h"
++#include "wine/context86.h"
+ 
+ #define my_strchr(str, chr) (char *)_mbschr((unsigned char *)(str), (unsigned int)(chr))
+ #define my_strtok(tok, del) (char *)_mbstok((unsigned char *)(tok), (const unsigned char *)(del))
+@@ -934,7 +935,7 @@ extern "C"
+                         {
+                             WORD addr = *(LPWORD)(oprom + 1);
+                             WORD seg = *(LPWORD)(oprom + 3);
+-                            LPLDT_ENTRY entry = wine_ldt + (seg >> 3);
++                            LDT_ENTRY * entry = wine_ldt + (seg >> 3);
+                             LPBYTE base = (LPBYTE)wine_ldt_get_base(entry);
+                             LPBYTE relay = base + addr;
+                             relay += 2; /* push bp */
+@@ -1307,7 +1308,7 @@ extern "C"
+                     (void(*)(void))GetProcAddress(krnl386, "DOSVM_start_bios_timer")();
+                 }
+                 /* allocate segment 40h */
+-                LPLDT_ENTRY entry = wine_ldt + (dosmem_0040H >> __AHSHIFT);
++                LDT_ENTRY * entry = wine_ldt + (dosmem_0040H >> __AHSHIFT);
+                 wine_ldt[0x40 >> __AHSHIFT] = *entry;
+                 wine_ldt_copy.base[0x40 >> __AHSHIFT] = wine_ldt_get_base(entry);
+                 wine_ldt_copy.limit[0x40 >> __AHSHIFT] = wine_ldt_get_limit(entry);
+diff --git a/wine/wine/port.h b/wine/wine/port.h
+index 9d6ed933..93648501 100644
+--- a/wine/wine/port.h
++++ b/wine/wine/port.h
+@@ -368,7 +368,7 @@ int symlink(const char *from, const char *to);
+ int usleep (unsigned int useconds);
+ #endif /* !defined(HAVE_USLEEP) */
+ 
+-#ifdef __i386__
++#if defined(__i386__) || defined(__aarch64__)
+ static inline void *memcpy_unaligned( void *dst, const void *src, size_t size )
+ {
+     return memcpy( dst, src, size );
+diff --git a/wine/wine/winbase16.h b/wine/wine/winbase16.h
+index 9b217634..9d3f8d03 100644
+--- a/wine/wine/winbase16.h
++++ b/wine/wine/winbase16.h
+@@ -112,6 +112,15 @@ typedef struct _TDB
+     PDB16     pdb;                /* 100 PDB for this task */
+ } TDB;
+ 
++/* access to the scheduler event of a TDB (32-bit on 64-bit hosts) */
++#ifdef _WIN64
++#define TDB_EVENT(t)        LongToHandle((t)->hEvent32)
++#define SET_TDB_EVENT(t, h) ((t)->hEvent32 = HandleToLong(h))
++#else
++#define TDB_EVENT(t)        ((t)->hEvent)
++#define SET_TDB_EVENT(t, h) ((t)->hEvent = (h))
++#endif
++
+ /* TDB flags */
+ #define TDBF_WINOLDAP   0x0001
+ #define TDBF_OS2APP     0x0008
+@@ -216,6 +225,15 @@ typedef struct _STACK16FRAME
+     WORD          cs;             /* 2e */
+ } STACK16FRAME;
+ 
++/* access to STACK16FRAME.frame32 (a 32-bit flat address on 64-bit hosts) */
++#ifdef _WIN64
++#define STACK16_FRAME32(f)        ((STACK32FRAME *)(ULONG_PTR)(f)->frame32)
++#define SET_STACK16_FRAME32(f, p) ((f)->frame32 = (DWORD)(ULONG_PTR)(p))
++#else
++#define STACK16_FRAME32(f)        ((f)->frame32)
++#define SET_STACK16_FRAME32(f, p) ((f)->frame32 = (p))
++#endif
++
+ /* argument type flags for relay debugging */
+ enum arg_types
+ {
+diff --git a/wine/wine/wine_common_ver.rc b/wine/wine/wine_common_ver.rc
+index b9d903d4..4544046b 100644
+--- a/wine/wine/wine_common_ver.rc
++++ b/wine/wine/wine_common_ver.rc
+@@ -123,7 +123,11 @@ FILESUBTYPE    WINE_FILESUBTYPE
+     BLOCK "StringFileInfo"
+     {
+         /* LANG_ENGLISH/SUBLANG_DEFAULT, WINE_CODEPAGE */
++#ifdef _WIN32
++	BLOCK "040904B0"  /* llvm-rc does not join adjacent strings here */
++#else
+ 	BLOCK "0409" WINE_CODEPAGE_STR
++#endif
+ 	{
+ 	    VALUE "CompanyName", "Microsoft Corporation" /* GameGuard depends on this */
+ 	    VALUE "FileDescription", WINE_FILEDESCRIPTION_STR
+diff --git a/wow32/wow_main.c b/wow32/wow_main.c
+index 41cc456c..b4944066 100644
+--- a/wow32/wow_main.c
++++ b/wow32/wow_main.c
+@@ -40,12 +40,12 @@
+ #undef WOWHandle32
+ #undef WOWYield16
+ 
+-BOOL   WINAPI K32WOWGetDescriptor(DWORD,LPLDT_ENTRY);
++BOOL   WINAPI K32WOWGetDescriptor(DWORD,LDT_ENTRY *);
+ 
+ /**********************************************************************
+  *           WOWGetDescriptor   (WOW32.1)
+  */
+-BOOL WINAPI WOWGetDescriptor( DWORD segptr, LPLDT_ENTRY ldtent )
++BOOL WINAPI WOWGetDescriptor( DWORD segptr, LDT_ENTRY * ldtent )
+ {
+     return K32WOWGetDescriptor( segptr, ldtent );
+ }

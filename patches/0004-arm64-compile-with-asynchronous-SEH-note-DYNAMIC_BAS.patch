@@ -1,0 +1,30 @@
+From e066cf7b30a7eb0c598622cb16b8f9ed0e10f55d Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:08:57 +0900
+Subject: [PATCH 04/27] arm64: compile with asynchronous SEH, note DYNAMIC_BASE
+ placement
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b1ea78f3..2a184b3f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,6 +28,14 @@ if (WINEVDM_ARM64)
+         # but not the type mismatches between same-size pointers
+         string(APPEND CMAKE_C_FLAGS " -fms-extensions -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -Wno-error=incompatible-pointer-types -Wno-error=return-mismatch -Wno-error=incompatible-function-pointer-types")
+         string(APPEND CMAKE_CXX_FLAGS " -fms-extensions")
++        # __try must also catch faults raised by loads and stores inside the
++        # __try body itself (the 16-bit memory accessors get inlined there):
++        # the clang driver drops -fasync-exceptions for mingw, so pass it to cc1
++        string(APPEND CMAKE_C_FLAGS " -Xclang -fasync-exceptions")
++        string(APPEND CMAKE_CXX_FLAGS " -Xclang -fasync-exceptions")
++        # lld always marks ARM64 images DYNAMIC_BASE, so Wine maps the DLLs in its
++        # 32-bit ASLR range (below 0x7c000000) when the image base is below 4GB;
++        # code that 16-bit modules see must therefore never rely on the preferred base.
+         # keep every image below 4GB: 16-bit code holds 32-bit flat pointers
+         # to 32-bit side functions (relay entry points, thunks, window procs)
+         string(APPEND CMAKE_SHARED_LINKER_FLAGS " -static -Wl,--disable-high-entropy-va")

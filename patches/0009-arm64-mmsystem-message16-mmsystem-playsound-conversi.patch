@@ -1,0 +1,304 @@
+From fb34f35009d30491ed6f9ee313c27bdf3b12bc1a Mon Sep 17 00:00:00 2001
+From: u <u@example.com>
+Date: Sat, 7 Nov 2026 10:06:53 +0900
+Subject: [PATCH 09/27] arm64: mmsystem: message16/mmsystem/playsound
+ conversions, WAVEHDR16, mixer structs
+
+---
+ mmsystem/message16.c | 54 ++++++++++++++++++++++++++++----------------
+ mmsystem/mmsystem.c  | 27 ++++++++++++++--------
+ mmsystem/playsound.c | 13 +++++++----
+ 3 files changed, 59 insertions(+), 35 deletions(-)
+
+diff --git a/mmsystem/message16.c b/mmsystem/message16.c
+index 672906b4..6e6bc967 100644
+--- a/mmsystem/message16.c
++++ b/mmsystem/message16.c
+@@ -51,6 +51,20 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winmm);
+ 
++/* ARM64: the WAVEHDR the 16-bit program sees (all fields 32 bits; the 32-bit WAVEHDR has 64-bit members) */
++#include <pshpack1.h>
++typedef struct {
++    SEGPTR lpData;
++    DWORD  dwBufferLength;
++    DWORD  dwBytesRecorded;
++    DWORD  dwUser;
++    DWORD  dwFlags;
++    DWORD  dwLoops;
++    SEGPTR lpNext;
++    DWORD  reserved;
++} WAVEHDR16;
++#include <poppack.h>
++
+ /* =================================
+  *       A U X    M A P P E R S
+  * ================================= */
+@@ -151,7 +165,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_MidiIn_Map16To32W  (UINT wMsg, DWORD_PTR* lpP
+ 		mh32->dwBytesRecorded = mh16->dwBytesRecorded;
+ 		mh32->dwUser = mh16->dwUser;
+ 		mh32->dwFlags = mh16->dwFlags;
+-		mh16->reserved = (MIDIHDR16*)mh32; /* for reuse in unprepare and write */
++		mh16->reserved = (DWORD)(ULONG_PTR)mh32; /* FIXME ARM64: assumes the heap block is below 4GB */ /* for reuse in unprepare and write */
+ 		*lpParam1 = (DWORD)mh32;
+ 		*lpParam2 = offsetof(MIDIHDR,dwOffset); /* old size, without dwOffset */
+ 
+@@ -165,7 +179,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_MidiIn_Map16To32W  (UINT wMsg, DWORD_PTR* lpP
+     case MIDM_UNPREPARE:
+ 	{
+ 	    LPMIDIHDR16		mh16 = MapSL(*lpParam1);
+-	    LPMIDIHDR		mh32 = (MIDIHDR*)mh16->reserved;
++	    LPMIDIHDR		mh32 = (MIDIHDR*)(ULONG_PTR)mh16->reserved;
+ 
+ 	    *lpParam1 = (DWORD)mh32;
+ 	    *lpParam2 = offsetof(MIDIHDR,dwOffset);
+@@ -223,7 +237,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_MidiIn_UnMap16To32W(UINT wMsg, DWORD_PTR* lpP
+ 	    LPMIDIHDR		mh32 = (LPMIDIHDR)(*lpParam1);
+ 	    LPMIDIHDR16		mh16 = MapSL(*(SEGPTR*)((LPSTR)mh32 - sizeof(LPMIDIHDR)));
+ 
+-	    assert((MIDIHDR*)mh16->reserved == mh32);
++	    assert((MIDIHDR*)(ULONG_PTR)mh16->reserved == mh32);
+ 	    mh16->dwFlags = mh32->dwFlags;
+ 
+ 	    if (wMsg == MODM_UNPREPARE && fn_ret == MMSYSERR_NOERROR) {
+@@ -324,7 +338,7 @@ static MMSYSTEM_MapType	MMSYSTDRV_MidiOut_Map16To32W  (UINT wMsg, DWORD_PTR* lpP
+ 		mh32->dwBytesRecorded = mh16->dwBytesRecorded;
+ 		mh32->dwUser = mh16->dwUser;
+ 		mh32->dwFlags = mh16->dwFlags;
+-		mh16->reserved = (MIDIHDR16*)mh32; /* for reuse in unprepare and write */
++		mh16->reserved = (DWORD)(ULONG_PTR)mh32; /* FIXME ARM64: assumes the heap block is below 4GB */ /* for reuse in unprepare and write */
+ 		*lpParam1 = (DWORD)mh32;
+ 		*lpParam2 = offsetof(MIDIHDR,dwOffset); /* old size, without dwOffset */
+ 
+@@ -338,7 +352,7 @@ static MMSYSTEM_MapType	MMSYSTDRV_MidiOut_Map16To32W  (UINT wMsg, DWORD_PTR* lpP
+     case MODM_LONGDATA:
+ 	{
+ 	    LPMIDIHDR16		mh16 = MapSL(*lpParam1);
+-	    LPMIDIHDR		mh32 = (MIDIHDR*)mh16->reserved;
++	    LPMIDIHDR		mh32 = (MIDIHDR*)(ULONG_PTR)mh16->reserved;
+ 
+ 	    *lpParam1 = (DWORD)mh32;
+ 	    *lpParam2 = offsetof(MIDIHDR,dwOffset);
+@@ -408,7 +422,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_MidiOut_UnMap16To32W(UINT wMsg, DWORD_PTR* lp
+ 	    LPMIDIHDR		mh32 = (LPMIDIHDR)(*lpParam1);
+ 	    LPMIDIHDR16		mh16 = MapSL(*(SEGPTR*)((LPSTR)mh32 - sizeof(LPMIDIHDR)));
+ 
+-	    assert((MIDIHDR*)mh16->reserved == mh32);
++	    assert((MIDIHDR*)(ULONG_PTR)mh16->reserved == mh32);
+ 	    mh16->dwFlags = mh32->dwFlags;
+ 
+ 	    if (wMsg == MODM_UNPREPARE && fn_ret == MMSYSERR_NOERROR) {
+@@ -519,7 +533,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveIn_Map16To32W  (UINT wMsg, DWORD_PTR* lpP
+     case WIDM_PREPARE:
+ 	{
+ 	    LPWAVEHDR		wh32 = HeapAlloc(GetProcessHeap(), 0, sizeof(LPWAVEHDR) + sizeof(WAVEHDR));
+-	    LPWAVEHDR		wh16 = MapSL(*lpParam1);
++	    WAVEHDR16		*wh16 = MapSL(*lpParam1);
+ 
+ 	    if (wh32) {
+ 		*(LPWAVEHDR*)wh32 = (LPWAVEHDR)*lpParam1;
+@@ -532,7 +546,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveIn_Map16To32W  (UINT wMsg, DWORD_PTR* lpP
+ 		wh32->dwLoops = wh16->dwLoops;
+ 		/* FIXME: nothing on wh32->reserved */
+ 		/* could link the wh32->reserved at this level for memory house keeping */
+-		wh16->reserved = wh32; /* for reuse in unprepare and write */
++		wh16->reserved = (DWORD)(ULONG_PTR)wh32; /* FIXME ARM64: assumes the heap block is below 4GB */ /* for reuse in unprepare and write */
+ 		*lpParam1 = (DWORD)wh32;
+ 		*lpParam2 = sizeof(WAVEHDR);
+ 
+@@ -545,8 +559,8 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveIn_Map16To32W  (UINT wMsg, DWORD_PTR* lpP
+     case WIDM_ADDBUFFER:
+     case WIDM_UNPREPARE:
+ 	{
+-	    LPWAVEHDR		wh16 = MapSL(*lpParam1);
+-	    LPWAVEHDR		wh32 = wh16->reserved;
++	    WAVEHDR16		*wh16 = MapSL(*lpParam1);
++	    LPWAVEHDR		wh32 = (LPWAVEHDR)(ULONG_PTR)wh16->reserved;
+ 
+ 	    *lpParam1 = (DWORD)wh32;
+ 	    *lpParam2 = sizeof(WAVEHDR);
+@@ -621,9 +635,9 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveIn_UnMap16To32W(UINT wMsg, DWORD_PTR* lpP
+     case WIDM_UNPREPARE:
+ 	{
+ 	    LPWAVEHDR		wh32 = (LPWAVEHDR)(*lpParam1);
+-	    LPWAVEHDR		wh16 = MapSL(*(SEGPTR*)((LPSTR)wh32 - sizeof(LPWAVEHDR)));
++	    WAVEHDR16		*wh16 = MapSL(*(SEGPTR*)((LPSTR)wh32 - sizeof(LPWAVEHDR)));
+ 
+-	    assert(wh16->reserved == wh32);
++	    assert((LPWAVEHDR)(ULONG_PTR)wh16->reserved == wh32);
+ 	    wh16->dwBytesRecorded = wh32->dwBytesRecorded;
+ 	    wh16->dwFlags = wh32->dwFlags;
+ 
+@@ -656,7 +670,7 @@ static  void    MMSYSTDRV_WaveIn_MapCB(UINT uMsg, DWORD_PTR* dwUser, DWORD_PTR*
+ 	    /* initial map is: 16 => 32 */
+ 	    LPWAVEHDR		wh32 = (LPWAVEHDR)(*dwParam1);
+ 	    SEGPTR		segwh16 = *(SEGPTR*)((LPSTR)wh32 - sizeof(LPWAVEHDR));
+-	    LPWAVEHDR		wh16 = MapSL(segwh16);
++	    WAVEHDR16		*wh16 = MapSL(segwh16);
+ 
+ 	    *dwParam1 = (DWORD)segwh16;
+ 	    wh16->dwFlags = wh32->dwFlags;
+@@ -739,7 +753,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveOut_Map16To32W  (UINT wMsg, DWORD_PTR* lp
+     case WODM_PREPARE:
+ 	{
+ 	    LPWAVEHDR		wh32 = HeapAlloc(GetProcessHeap(), 0, sizeof(LPWAVEHDR) + sizeof(DWORD) + sizeof(WAVEHDR));
+-	    LPWAVEHDR		wh16 = MapSL(*lpParam1);
++	    WAVEHDR16		*wh16 = MapSL(*lpParam1);
+ 
+ 	    if (wh32) {
+ 		*(LPWAVEHDR*)wh32 = (LPWAVEHDR)*lpParam1;
+@@ -753,7 +767,7 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveOut_Map16To32W  (UINT wMsg, DWORD_PTR* lp
+ 		wh32->dwLoops = wh16->dwLoops;
+ 		/* FIXME: nothing on wh32->reserved */
+ 		/* could link the wh32->reserved at this level for memory house keeping */
+-		wh16->reserved = wh32; /* for reuse in unprepare and write */
++		wh16->reserved = (DWORD)(ULONG_PTR)wh32; /* FIXME ARM64: assumes the heap block is below 4GB */ /* for reuse in unprepare and write */
+ 		*lpParam1 = (DWORD)wh32;
+ 		*lpParam2 = sizeof(WAVEHDR);
+ 
+@@ -766,8 +780,8 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveOut_Map16To32W  (UINT wMsg, DWORD_PTR* lp
+     case WODM_UNPREPARE:
+     case WODM_WRITE:
+ 	{
+-	    LPWAVEHDR		wh16 = MapSL(*lpParam1);
+-	    LPWAVEHDR		wh32 = wh16->reserved;
++	    WAVEHDR16		*wh16 = MapSL(*lpParam1);
++	    LPWAVEHDR		wh32 = (LPWAVEHDR)(ULONG_PTR)wh16->reserved;
+ 	    if (wMsg == WODM_UNPREPARE)
+ 		    wh32->dwFlags = wh16->dwFlags;
+ 
+@@ -854,9 +868,9 @@ static  MMSYSTEM_MapType	MMSYSTDRV_WaveOut_UnMap16To32W(UINT wMsg, DWORD_PTR* lp
+     case WODM_WRITE:
+ 	{
+ 	    LPWAVEHDR		wh32 = (LPWAVEHDR)(*lpParam1);
+-	    LPWAVEHDR		wh16 = MapSL(*(SEGPTR*)((LPSTR)wh32 - sizeof(DWORD) - sizeof(LPWAVEHDR)));
++	    WAVEHDR16		*wh16 = MapSL(*(SEGPTR*)((LPSTR)wh32 - sizeof(DWORD) - sizeof(LPWAVEHDR)));
+ 
+-	    assert(wh16->reserved == wh32);
++	    assert((LPWAVEHDR)(ULONG_PTR)wh16->reserved == wh32);
+ 	    wh16->dwFlags = wh32->dwFlags;
+ 
+ 	    if (wMsg == WODM_UNPREPARE && fn_ret == MMSYSERR_NOERROR) {
+@@ -888,7 +902,7 @@ static  void	MMSYSTDRV_WaveOut_MapCB(UINT uMsg, DWORD_PTR* dwUser, DWORD_PTR* dw
+ 	    /* initial map is: 16 => 32 */
+ 	    LPWAVEHDR		wh32 = (LPWAVEHDR)(*dwParam1);
+ 	    SEGPTR		segwh16 = *(SEGPTR*)((LPSTR)wh32 - sizeof(DWORD) - sizeof(LPWAVEHDR));
+-	    LPWAVEHDR		wh16 = MapSL(segwh16);
++	    WAVEHDR16		*wh16 = MapSL(segwh16);
+ 
+ 	    *dwParam1 = (DWORD)segwh16;
+ 	    wh16->dwFlags = wh32->dwFlags;
+diff --git a/mmsystem/mmsystem.c b/mmsystem/mmsystem.c
+index afcc8041..82f0bb75 100644
+--- a/mmsystem/mmsystem.c
++++ b/mmsystem/mmsystem.c
+@@ -403,6 +403,7 @@ UINT16 WINAPI mixerOpen16(LPHMIXER16 lphmix, UINT16 uDeviceID, DWORD dwCallback,
+ {
+     HMIXER	                hmix;
+     UINT	                ret;
++    DWORD_PTR               dwCallback32 = dwCallback;
+     // mixer doesn't support CALLBACK_FUNCTION without which only CALLBACK_WINDOW isn't difficult 
+     // wine source says CALLBACK_THREAD and CALLBACK_EVENT weren't supported until win2k
+     if (fdwOpen & CALLBACK_TYPEMASK)
+@@ -412,9 +413,9 @@ UINT16 WINAPI mixerOpen16(LPHMIXER16 lphmix, UINT16 uDeviceID, DWORD dwCallback,
+             ERR("called with unsupported callback type %x\n", fdwOpen & CALLBACK_TYPEMASK);
+             return MMSYSERR_NOTSUPPORTED;
+         }
+-        dwCallback = HWND_32(dwCallback);
++        dwCallback32 = (DWORD_PTR)HWND_32(dwCallback);
+     }
+-    ret = mixerOpen(&hmix, uDeviceID, dwCallback, dwInstance, fdwOpen);
++    ret = mixerOpen(&hmix, uDeviceID, dwCallback32, dwInstance, fdwOpen);
+     if (ret == MMSYSERR_NOERROR)
+     {
+         if (lphmix) *lphmix = HMIXER_16(hmix);
+@@ -452,17 +453,23 @@ UINT16 WINAPI mixerGetControlDetails16(HMIXEROBJ16 hmix,
+ {
+     DWORD	ret = MMSYSERR_NOTENABLED;
+     SEGPTR	sppaDetails;
++    MIXERCONTROLDETAILS mcd32;
+ 
+     TRACE("(%04x, %p, %08x)\n", hmix, lpmcd, fdwDetails);
+ 
+     if (lpmcd == NULL || lpmcd->cbStruct != sizeof(*lpmcd))
+ 	return MMSYSERR_INVALPARAM;
+ 
++    /* ARM64: MIXERCONTROLDETAILS has 64-bit members, so build the 32-bit structure explicitly */
++    memset(&mcd32, 0, sizeof(mcd32));
++    mcd32.cbStruct = sizeof(mcd32);
++    mcd32.dwControlID = lpmcd->dwControlID;
++    mcd32.cChannels = lpmcd->cChannels;
++    mcd32.cMultipleItems = lpmcd->u.cMultipleItems;
++    mcd32.cbDetails = lpmcd->cbDetails;
+     sppaDetails = (SEGPTR)lpmcd->paDetails;
+-    lpmcd->paDetails = MapSL(sppaDetails);
+-    ret = mixerGetControlDetailsA(HMIXEROBJ_32(hmix),
+-			         (LPMIXERCONTROLDETAILS)lpmcd, fdwDetails);
+-    lpmcd->paDetails = (LPVOID)sppaDetails;
++    mcd32.paDetails = MapSL(sppaDetails);
++    ret = mixerGetControlDetailsA(HMIXEROBJ_32(hmix), &mcd32, fdwDetails);
+ 
+     return ret;
+ }
+@@ -487,8 +494,8 @@ UINT16 WINAPI mixerGetLineControls16(HMIXEROBJ16 hmix,
+ 
+     mlcA.cbStruct = sizeof(mlcA);
+     mlcA.dwLineID = lpmlc16->dwLineID;
+-    mlcA.u.dwControlID = lpmlc16->u.dwControlID;
+-    mlcA.u.dwControlType = lpmlc16->u.dwControlType;
++    mlcA.dwControlID = lpmlc16->u.dwControlID;
++    mlcA.dwControlType = lpmlc16->u.dwControlType;
+     mlcA.cControls = lpmlc16->cControls;
+     mlcA.cbmxctrl = sizeof(MIXERCONTROLA);
+     mlcA.pamxctrl = HeapAlloc(GetProcessHeap(), 0,
+@@ -498,8 +505,8 @@ UINT16 WINAPI mixerGetLineControls16(HMIXEROBJ16 hmix,
+ 
+     if (ret == MMSYSERR_NOERROR) {
+ 	lpmlc16->dwLineID = mlcA.dwLineID;
+-	lpmlc16->u.dwControlID = mlcA.u.dwControlID;
+-	lpmlc16->u.dwControlType = mlcA.u.dwControlType;
++	lpmlc16->u.dwControlID = mlcA.dwControlID;
++	lpmlc16->u.dwControlType = mlcA.dwControlType;
+ 	lpmlc16->cControls = mlcA.cControls;
+ 
+ 	lpmc16 = MapSL(lpmlc16->pamxctrl);
+diff --git a/mmsystem/playsound.c b/mmsystem/playsound.c
+index 4ad80224..635ca6e6 100644
+--- a/mmsystem/playsound.c
++++ b/mmsystem/playsound.c
+@@ -23,6 +23,7 @@
+ 
+ #include <stdarg.h>
+ #include <string.h>
++#include <stdlib.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -291,11 +292,13 @@ static DWORD WINAPI proc_PlaySound(LPVOID arg)
+ 
+     /* if resource, grab it */
+     if ((wps->fdwSound & SND_RESOURCE) == SND_RESOURCE) {
+-        HRSRC	hRes;
+-        HGLOBAL	hGlob;
++        HRSRC16	hRes;
++        HGLOBAL16	hGlob;
++        /* ARM64: wps->hMod carries a 16-bit module handle on this path */
++        HINSTANCE16 hMod16 = (HINSTANCE16)(ULONG_PTR)wps->hMod;
+ 
+-        if ((hRes = FindResource16(wps->hMod, wps->pszSound, L"WAVE")) == 0 ||
+-            (hGlob = LoadResource16(wps->hMod, hRes)) == 0)
++        if ((hRes = FindResource16(hMod16, wps->pszSound, L"WAVE")) == 0 ||
++            (hGlob = LoadResource16(hMod16, hRes)) == 0)
+             goto errCleanUp;
+         if ((data = LockResource16(hGlob)) == NULL) {
+             FreeResource16(hGlob);
+@@ -561,7 +564,7 @@ static BOOL MULTIMEDIA_PlaySound(const void* pszSound, HMODULE hmod, DWORD fdwSo
+  */
+ BOOL16 WINAPI PlaySound16(LPCSTR pszSoundA, HMODULE16 hmod, DWORD fdwSound)
+ {
+-    return MULTIMEDIA_PlaySound(pszSoundA, hmod, fdwSound, FALSE);
++    return MULTIMEDIA_PlaySound(pszSoundA, (HMODULE)(ULONG_PTR)hmod, fdwSound, FALSE);
+ }
+ 
+ /**************************************************************************

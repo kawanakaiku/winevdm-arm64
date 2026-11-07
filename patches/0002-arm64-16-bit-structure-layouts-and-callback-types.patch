@@ -1,0 +1,759 @@
+From 3d70aaa6b10dc007b68feb9422be38b995917d18 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 09:57:51 +0900
+Subject: [PATCH 02/27] arm64: 16-bit structure layouts and callback types
+
+- 16-bit callback 'function pointer' types are SEGPTR on 64-bit hosts.
+- LPARAM16/LRESULT16 for the 32-bit LPARAM/LRESULT fields of 16-bit
+  structures; pointer fields that hold 16:16 values become SEGPTR.
+- ENTRYPOINT16/CALLFROM16/STACK16FRAME hold 32-bit flat addresses,
+  TDB keeps its layout (8-byte teb, 32-bit event handle).
+- Add wine/native_thunk.h: ARM64 closure stubs replacing the x86
+  thunks that are called by the native side.
+- winecrt0: the setjmp based exception support is not needed with
+  compiler exceptions.
+---
+ CMakeLists.txt             |  5 +++-
+ commdlg/cdlg16.h           | 34 +++++++++++++++++++----
+ krnl386/kernel16_private.h | 18 ++++++++++++
+ msvideo/vfw16.h            | 20 ++++++++++++++
+ toolhelp/toolhelp.h        |  8 ++++++
+ wine/wine/exception.h      |  1 +
+ wine/wine/mmsystem16.h     | 36 ++++++++++++++++++++++++
+ wine/wine/native_thunk.h   | 48 ++++++++++++++++++++++++++++++++
+ wine/wine/server.h         |  2 ++
+ wine/wine/winbase16.h      | 12 ++++++++
+ wine/wine/windef16.h       | 56 ++++++++++++++++++++++++++++++++++++++
+ wine/wine/wingdi16.h       | 20 ++++++++++++++
+ wine/wine/winuser16.h      | 24 ++++++++++------
+ winecrt0/exception.c       |  2 +-
+ winnls/winnls.c            |  6 ++--
+ 15 files changed, 274 insertions(+), 18 deletions(-)
+ create mode 100644 wine/wine/native_thunk.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f9a91fb2..b1ea78f3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,7 +23,10 @@ if (WINEVDM_ARM64)
+     set(CONVSPEC_ARCH --arm64)
+     if (NOT(MSVC))
+         add_definitions(-DUSE_COMPILER_EXCEPTIONS)
+-        string(APPEND CMAKE_C_FLAGS " -fms-extensions -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast")
++        # the sources were written for MSVC: keep pointer/integer mixups and
++        # implicit declarations as errors (they truncate 64-bit pointers),
++        # but not the type mismatches between same-size pointers
++        string(APPEND CMAKE_C_FLAGS " -fms-extensions -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -Wno-error=incompatible-pointer-types -Wno-error=return-mismatch -Wno-error=incompatible-function-pointer-types")
+         string(APPEND CMAKE_CXX_FLAGS " -fms-extensions")
+         # keep every image below 4GB: 16-bit code holds 32-bit flat pointers
+         # to 32-bit side functions (relay entry points, thunks, window procs)
+diff --git a/commdlg/cdlg16.h b/commdlg/cdlg16.h
+index 032d4a72..9bd0d9ac 100644
+--- a/commdlg/cdlg16.h
++++ b/commdlg/cdlg16.h
+@@ -33,7 +33,11 @@
+ 
+ #include "pshpack1.h"
+ 
++#ifdef _WIN64
++typedef SEGPTR LPOFNHOOKPROC16;
++#else
+ typedef UINT16 (CALLBACK *LPOFNHOOKPROC16)(HWND16,UINT16,WPARAM16,LPARAM);
++#endif
+ 
+ typedef struct {
+ 	DWORD		lStructSize;
+@@ -53,12 +57,16 @@ typedef struct {
+ 	UINT16		nFileOffset;
+ 	UINT16		nFileExtension;
+ 	SEGPTR		lpstrDefExt;
+-	LPARAM 		lCustData;
++	LPARAM16 		lCustData;
+ 	LPOFNHOOKPROC16 lpfnHook;
+ 	SEGPTR 		lpTemplateName;
+ }   OPENFILENAME16,*LPOPENFILENAME16;
+ 
++#ifdef _WIN64
++typedef SEGPTR LPCCHOOKPROC16;
++#else
+ typedef UINT16 (CALLBACK *LPCCHOOKPROC16) (HWND16, UINT16, WPARAM16, LPARAM);
++#endif
+ 
+ typedef struct {
+ 	DWORD		lStructSize;
+@@ -67,13 +75,17 @@ typedef struct {
+ 	COLORREF	rgbResult;
+ 	SEGPTR          lpCustColors;
+ 	DWORD 		Flags;
+-	LPARAM		lCustData;
++	LPARAM16		lCustData;
+         LPCCHOOKPROC16  lpfnHook;
+ 	SEGPTR 		lpTemplateName;
+ } CHOOSECOLOR16;
+ typedef CHOOSECOLOR16 *LPCHOOSECOLOR16;
+ 
++#ifdef _WIN64
++typedef SEGPTR LPFRHOOKPROC16;
++#else
+ typedef UINT16 (CALLBACK *LPFRHOOKPROC16)(HWND16,UINT16,WPARAM16,LPARAM);
++#endif
+ typedef struct {
+ 	DWORD		lStructSize; 		/* size of this struct 0x20 */
+ 	HWND16		hwndOwner; 		/* handle to owner's window */
+@@ -84,12 +96,16 @@ typedef struct {
+ 	SEGPTR		lpstrReplaceWith;       /* ptr. to replace string   */
+ 	UINT16		wFindWhatLen;           /* size of find buffer      */
+ 	UINT16 		wReplaceWithLen;        /* size of replace buffer   */
+-	LPARAM 		lCustData;              /* data passed to hook fn.  */
++	LPARAM16 		lCustData;              /* data passed to hook fn.  */
+         LPFRHOOKPROC16  lpfnHook;
+ 	SEGPTR 		lpTemplateName;         /* custom template name     */
+ } FINDREPLACE16, *LPFINDREPLACE16;
+ 
++#ifdef _WIN64
++typedef SEGPTR LPCFHOOKPROC16;
++#else
+ typedef UINT16 (CALLBACK *LPCFHOOKPROC16)(HWND16,UINT16,WPARAM16,LPARAM);
++#endif
+ typedef struct
+ {
+ 	DWORD			lStructSize;
+@@ -99,7 +115,7 @@ typedef struct
+ 	short			iPointSize;         /* 10 * size in points of selected font */
+ 	DWORD			Flags;              /* enum. type flags         */
+ 	COLORREF		rgbColors;          /* returned text color      */
+-	LPARAM	                lCustData;          /* data passed to hook fn.  */
++	LPARAM16	                lCustData;          /* data passed to hook fn.  */
+ 	LPCFHOOKPROC16          lpfnHook;
+ 	SEGPTR			lpTemplateName;     /* custom template name     */
+ 	HINSTANCE16		hInstance;          /* instance handle of.EXE that   */
+@@ -115,8 +131,16 @@ typedef struct
+ } CHOOSEFONT16, *LPCHOOSEFONT16;
+ 
+ 
++#ifdef _WIN64
++typedef SEGPTR LPPRINTHOOKPROC16;
++#else
+ typedef UINT16 (CALLBACK *LPPRINTHOOKPROC16) (HWND16, UINT16, WPARAM16, LPARAM);
++#endif
++#ifdef _WIN64
++typedef SEGPTR LPSETUPHOOKPROC16;
++#else
+ typedef UINT16 (CALLBACK *LPSETUPHOOKPROC16) (HWND16, UINT16, WPARAM16, LPARAM);
++#endif
+ typedef struct
+ {
+     DWORD            lStructSize;
+@@ -131,7 +155,7 @@ typedef struct
+     WORD             nMaxPage;
+     WORD             nCopies;
+     HINSTANCE16      hInstance;
+-    LPARAM           lCustData;
++    LPARAM16           lCustData;
+     LPPRINTHOOKPROC16 lpfnPrintHook;
+     LPSETUPHOOKPROC16 lpfnSetupHook;
+     SEGPTR           lpPrintTemplateName;
+diff --git a/krnl386/kernel16_private.h b/krnl386/kernel16_private.h
+index 1b267bf6..7142a47e 100644
+--- a/krnl386/kernel16_private.h
++++ b/krnl386/kernel16_private.h
+@@ -114,6 +114,14 @@
+ #undef PEB //PEB_WINTERNL_H
+ #undef PPEB//// PPEB_WINTERNL_H
+ #undef NtCurrentTeb// NtCurrentTeb__
++#ifdef __aarch64__
++static inline struct _TEB *NtCurrentTeb(void)
++{
++    struct _TEB *teb;
++    __asm__("mov %0, x18" : "=r" (teb));
++    return teb;
++}
++#endif
+ #ifdef _TEB
+ #error aaa
+ #endif
+@@ -574,7 +582,11 @@ typedef struct
+ {
+     BYTE   pushw_bp;               /* pushw %bp */
+     WORD   pushl;                  /* pushl $target */
++#ifdef _WIN64
++    DWORD  target;                 /* flat 32-bit address (images are below 4GB) */
++#else
+     void  *target;
++#endif
+     BYTE   call;                   /* call CALLFROM16 */
+     short  callfrom16;
+ } ENTRYPOINT16;
+@@ -582,9 +594,15 @@ typedef struct
+ typedef struct
+ {
+     WORD   pushl;                  /* pushl $relay */
++#ifdef _WIN64
++    DWORD  relay;                  /* flat 32-bit addresses (images are below 4GB) */
++    WORD   lcall;                  /* lcall __FLATCS__:glue */
++    DWORD  glue;
++#else
+     void  *relay;
+     WORD   lcall;                  /* lcall __FLATCS__:glue */
+     void  *glue;
++#endif
+     WORD   flatcs;
+     BYTE   ret[12];                 /* return sequence */
+     WORD   movl;                   /* movl arg_types[1],arg_types[0](%esi) */
+diff --git a/msvideo/vfw16.h b/msvideo/vfw16.h
+index 5cf97915..f422f44e 100644
+--- a/msvideo/vfw16.h
++++ b/msvideo/vfw16.h
+@@ -53,10 +53,26 @@ typedef struct {
+ 
+ typedef struct {
+     DWORD		dwFlags;
++#ifdef _WIN64
++    SEGPTR lpbiSrc;
++#else
+     LPBITMAPINFOHEADER	lpbiSrc;
++#endif
++#ifdef _WIN64
++    SEGPTR lpSrc;
++#else
+     LPVOID		lpSrc;
++#endif
++#ifdef _WIN64
++    SEGPTR lpbiDst;
++#else
+     LPBITMAPINFOHEADER	lpbiDst;
++#endif
++#ifdef _WIN64
++    SEGPTR lpDst;
++#else
+     LPVOID		lpDst;
++#endif
+ 
+     INT16  		xDst;       /* destination rectangle */
+     INT16		yDst;
+@@ -78,7 +94,11 @@ typedef struct {
+ 	INT16		yDst;
+ 	INT16		dxDst;
+ 	INT16		dyDst;
++#ifdef _WIN64
++	SEGPTR lpbi;
++#else
+ 	LPBITMAPINFOHEADER	lpbi;
++#endif
+ 	INT16		xSrc;
+ 	INT16		ySrc;
+ 	INT16		dxSrc;
+diff --git a/toolhelp/toolhelp.h b/toolhelp/toolhelp.h
+index 073d78c1..d0f4cbde 100644
+--- a/toolhelp/toolhelp.h
++++ b/toolhelp/toolhelp.h
+@@ -392,7 +392,11 @@ typedef struct {
+ typedef struct {
+ 	DWORD	dwSize;
+ 	UINT16	wErrCode;
++#ifdef _WIN64
++	SEGPTR lpInfo; /* depends on wErrCode */
++#else
+ 	VOID   *lpInfo; /* depends on wErrCode */
++#endif
+ } NFYLOGERROR;
+ 
+ /* called for parameter errors? */
+@@ -401,7 +405,11 @@ typedef struct {
+     DWORD       dwSize;
+     UINT16      wErrCode;
+     FARPROC16   lpfnErrorAddr;
++#ifdef _WIN64
++    SEGPTR lpBadParam;
++#else
+     void      **lpBadParam;
++#endif
+ } NFYLOGPARAMERROR;
+ 
+ typedef struct {
+diff --git a/wine/wine/exception.h b/wine/wine/exception.h
+index 6d77db9c..e2a82e64 100644
+--- a/wine/wine/exception.h
++++ b/wine/wine/exception.h
+@@ -24,6 +24,7 @@
+ #include <setjmp.h>
+ typedef jmp_buf sigjmp_buf;
+ #include <windef.h>
++#include "wine/context86.h"
+ #include <excpt.h>
+ #define DECLSPEC_HIDDEN
+ 
+diff --git a/wine/wine/mmsystem16.h b/wine/wine/mmsystem16.h
+index 6cd2b181..130d8768 100644
+--- a/wine/wine/mmsystem16.h
++++ b/wine/wine/mmsystem16.h
+@@ -103,7 +103,11 @@ HMODULE16 WINAPI GetDriverModuleHandle16(HDRVR16);
+ HDRVR16   WINAPI GetNextDriver16(HDRVR16,DWORD);
+ BOOL16    WINAPI GetDriverInfo16(HDRVR16,DRIVERINFOSTRUCT16 *);
+ 
++#ifdef _WIN64
++typedef SEGPTR LPDRVCALLBACK16;
++#else
+ typedef void (CALLBACK *LPDRVCALLBACK16) (HDRVR16,UINT16,DWORD,DWORD,DWORD);
++#endif
+ typedef LPDRVCALLBACK16 LPWAVECALLBACK16;
+ 
+ UINT16    WINAPI mmsystemGetVersion16(void);
+@@ -130,7 +134,11 @@ typedef struct {
+ 
+ typedef struct {
+ 	HWAVE16			hWave;
++#ifdef _WIN64
++	SEGPTR lpFormat;
++#else
+ 	LPWAVEFORMATEX		lpFormat;
++#endif
+ 	DWORD			dwCallback;
+ 	DWORD			dwInstance;
+ 	UINT16			uMappedDeviceID;
+@@ -196,12 +204,20 @@ typedef struct {
+ } MIDIINCAPS16, *LPMIDIINCAPS16;
+ 
+ typedef struct midihdr16_tag {
++#ifdef _WIN64
++    SEGPTR lpData;		/* pointer to locked data block */
++#else
+     LPSTR	lpData;		/* pointer to locked data block */
++#endif
+     DWORD	dwBufferLength;	/* length of data in data block */
+     DWORD	dwBytesRecorded;/* used for input only */
+     DWORD	dwUser;		/* for client's use */
+     DWORD	dwFlags;	/* assorted flags (see defines) */
++#ifdef _WIN64
++    SEGPTR lpNext;	/* reserved for driver */
++#else
+     struct midihdr16_tag *lpNext;	/* reserved for driver */
++#endif
+     DWORD	reserved;	/* reserved for driver */
+ } MIDIHDR16, *LPMIDIHDR16;
+ 
+@@ -262,7 +278,11 @@ typedef struct {
+     DWORD	dwSupport;		/* functionality supported by driver */
+ } AUXCAPS16, *LPAUXCAPS16;
+ 
++#ifdef _WIN64
++typedef SEGPTR LPTIMECALLBACK16;
++#else
+ typedef void (CALLBACK *LPTIMECALLBACK16)(UINT16,UINT16,DWORD,DWORD,DWORD);
++#endif
+ 
+ typedef struct {
+     UINT16	wPeriodMin;	/* minimum period supported  */
+@@ -316,7 +336,11 @@ typedef struct {
+ typedef struct tMIXEROPENDESC16
+ {
+ 	HMIXEROBJ16		hmx;
++#ifdef _WIN64
++        SEGPTR pReserved0;
++#else
+         LPVOID			pReserved0;
++#endif
+ 	DWORD			dwCallback;
+ 	DWORD			dwInstance;
+ } MIXEROPENDESC16, *LPMIXEROPENDESC16;
+@@ -391,7 +415,11 @@ typedef struct {
+         DWORD	cMultipleItems;	/* if _MULTIPLE, the number of items per channel */
+     } u;
+     DWORD	cbDetails;	/* size of _one_ details_XX struct */
++#ifdef _WIN64
++    SEGPTR paDetails;	/* pointer to array of details_XX structs */
++#else
+     LPVOID	paDetails;	/* pointer to array of details_XX structs */
++#endif
+ } MIXERCONTROLDETAILS16,*LPMIXERCONTROLDETAILS16;
+ 
+ typedef struct {
+@@ -400,8 +428,12 @@ typedef struct {
+     CHAR	szName[MIXER_LONG_NAME_CHARS];
+ } MIXERCONTROLDETAILS_LISTTEXT16,*LPMIXERCONTROLDETAILS_LISTTEXT16;
+ 
++#ifdef _WIN64
++typedef SEGPTR LPMMIOPROC16;
++#else
+ typedef LRESULT (CALLBACK *LPMMIOPROC16)(LPSTR lpmmioinfo,UINT16 uMessage,
+ 					 LPARAM lParam1,LPARAM lParam2);
++#endif
+ 
+ typedef struct {
+         DWORD		dwFlags;	/* general status flags */
+@@ -425,7 +457,11 @@ typedef struct {
+         HMMIO16		hmmio;		/* handle to open file */
+ } MMIOINFO16, *LPMMIOINFO16;
+ 
++#ifdef _WIN64
++typedef SEGPTR YIELDPROC16;
++#else
+ typedef UINT16 (CALLBACK *YIELDPROC16)(UINT16,DWORD);
++#endif
+ 
+ UINT16		WINAPI auxGetNumDevs16(void);
+ UINT16		WINAPI auxGetDevCaps16 (UINT16,LPAUXCAPS16,UINT16);
+diff --git a/wine/wine/native_thunk.h b/wine/wine/native_thunk.h
+new file mode 100644
+index 00000000..89656c53
+--- /dev/null
++++ b/wine/wine/native_thunk.h
+@@ -0,0 +1,48 @@
++/*
++ * Small native code stubs ("closures") called by the 32/64-bit side,
++ * for example a TIMERPROC or a WNDPROC that has to reach a 16-bit
++ * procedure.  The stub inserts 'data' as the first argument and jumps
++ * to 'func', so 'func' receives (data, original arguments...).
++ *
++ * i386 builds keep their own hand written x86 thunks; this header is
++ * used on ARM64, where at most 7 original register arguments are kept
++ * (x0-x6 move to x1-x7; stack arguments are passed through unchanged).
++ */
++#ifndef __WINE_NATIVE_THUNK_H
++#define __WINE_NATIVE_THUNK_H
++
++#include <windef.h>
++#include <winbase.h>
++
++#ifdef __aarch64__
++
++typedef struct
++{
++    DWORD code[10];
++    void *data;   /* code + 40 */
++    void *func;   /* code + 48 */
++} NATIVE_CLOSURE;
++
++static inline void init_native_closure( NATIVE_CLOSURE *c, void *data, void *func )
++{
++    int i;
++    /* mov x7, x6 ... mov x1, x0 */
++    for (i = 0; i < 7; i++)
++        c->code[i] = 0xaa0003e0 | ((6 - i) << 16) | (7 - i);
++    c->code[7] = 0x58000000 | (((40 - 7 * 4) / 4) << 5) | 0;   /* ldr x0, data */
++    c->code[8] = 0x58000000 | (((48 - 8 * 4) / 4) << 5) | 16;  /* ldr x16, func */
++    c->code[9] = 0xd61f0200;                                   /* br x16 */
++    c->data = data;
++    c->func = func;
++    FlushInstructionCache( GetCurrentProcess(), c, sizeof(*c) );
++}
++
++/* only update the target data of an existing closure */
++static inline void set_native_closure_data( NATIVE_CLOSURE *c, void *data )
++{
++    c->data = data;
++}
++
++#endif /* __aarch64__ */
++
++#endif /* __WINE_NATIVE_THUNK_H */
+diff --git a/wine/wine/server.h b/wine/wine/server.h
+index d573d1f7..6923d417 100644
+--- a/wine/wine/server.h
++++ b/wine/wine/server.h
+@@ -55,6 +55,8 @@ extern int CDECL wine_server_fd_to_handle( int fd, unsigned int access, unsigned
+ extern int CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int access, int *unix_fd, unsigned int *options );
+ extern void CDECL wine_server_release_fd( HANDLE handle, int unix_fd );
+ 
++ULONG WINAPI RtlNtStatusToDosError(LONG);
++
+ /* do a server call and set the last error code */
+ static inline unsigned int wine_server_call_err( void *req_ptr )
+ {
+diff --git a/wine/wine/winbase16.h b/wine/wine/winbase16.h
+index 2d428a68..9b217634 100644
+--- a/wine/wine/winbase16.h
++++ b/wine/wine/winbase16.h
+@@ -88,7 +88,11 @@ typedef struct _TDB
+     DWORD     compat_flags;       /* 4e Compatibility flags */
+     BYTE      unused4[2];         /* 52 */
+     struct _TEB *teb;             /* 54 Pointer to thread database */
++#ifdef _WIN64
++    BYTE      unused5[4];         /* 5c (teb takes 8 bytes) */
++#else
+     BYTE      unused5[8];         /* 58 */
++#endif
+     HANDLE16  hPDB;               /* 60 Selector of PDB (i.e. PSP) */
+     SEGPTR    dta;                /* 62 Current DTA */
+     BYTE      curdrive;           /* 66 Current drive */
+@@ -100,7 +104,11 @@ typedef struct _TDB
+     WORD      thunks[8*4];        /* b2 Make proc instance thunks */
+     CHAR      module_name[8];     /* f2 Module name for task */
+     WORD      magic;              /* fa TDB signature */
++#ifdef _WIN64
++    DWORD     hEvent32;           /* fc scheduler event handle (handles fit in 32 bits) */
++#else
+     HANDLE    hEvent;             /* fc scheduler event handle */
++#endif
+     PDB16     pdb;                /* 100 PDB for this task */
+ } TDB;
+ 
+@@ -186,7 +194,11 @@ typedef struct _STACK32FRAME
+ /* 16-bit stack layout after __wine_call_from_16() */
+ typedef struct _STACK16FRAME
+ {
++#ifdef _WIN64
++    DWORD         frame32;        /* 00 32-bit frame from last CallTo16() (flat address below 4GB) */
++#else
+     STACK32FRAME *frame32;        /* 00 32-bit frame from last CallTo16() */
++#endif
+     DWORD         edx;            /* 04 saved registers */
+     DWORD         ecx;            /* 08 */
+     DWORD         ebp;            /* 0c */
+diff --git a/wine/wine/windef16.h b/wine/wine/windef16.h
+index 572d5408..df1264b4 100644
+--- a/wine/wine/windef16.h
++++ b/wine/wine/windef16.h
+@@ -35,6 +35,10 @@
+ typedef unsigned short  BOOL16;
+ typedef DWORD           SEGPTR;
+ 
++/* LPARAM and LRESULT as seen by 16-bit code (32-bit on every host) */
++typedef LONG            LPARAM16;
++typedef LONG            LRESULT16;
++
+ typedef UINT16          HANDLE16;
+ typedef HANDLE16       *LPHANDLE16;
+ 
+@@ -149,22 +153,74 @@ typedef struct
+ 
+ /* Callback function pointers types */
+ 
++#ifdef _WIN64
++typedef SEGPTR DRIVERPROC16;
++#else
+ typedef LRESULT (CALLBACK *DRIVERPROC16)(DWORD,HDRVR16,UINT16,LPARAM,LPARAM);
++#endif
++#ifdef _WIN64
++typedef SEGPTR DLGPROC16;
++#else
+ typedef BOOL16  (CALLBACK *DLGPROC16)(HWND16,UINT16,WPARAM16,LPARAM);
++#endif
++#ifdef _WIN64
++typedef SEGPTR EDITWORDBREAKPROC16;
++#else
+ typedef INT16   (CALLBACK *EDITWORDBREAKPROC16)(LPSTR,INT16,INT16,INT16);
++#endif
++#ifdef _WIN64
++typedef SEGPTR GRAYSTRINGPROC16;
++#else
+ typedef BOOL16  (CALLBACK *GRAYSTRINGPROC16)(HDC16,LPARAM,INT16);
++#endif
++#ifdef _WIN64
++typedef SEGPTR HOOKPROC16;
++#else
+ typedef LRESULT (CALLBACK *HOOKPROC16)(INT16,WPARAM16,LPARAM);
++#endif
++#ifdef _WIN64
++typedef SEGPTR PROPENUMPROC16;
++#else
+ typedef BOOL16  (CALLBACK *PROPENUMPROC16)(HWND16,SEGPTR,HANDLE16);
++#endif
++#ifdef _WIN64
++typedef SEGPTR TIMERPROC16;
++#else
+ typedef VOID    (CALLBACK *TIMERPROC16)(HWND16,UINT16,UINT16,DWORD);
++#endif
++#ifdef _WIN64
++typedef SEGPTR WNDENUMPROC16;
++#else
+ typedef LRESULT (CALLBACK *WNDENUMPROC16)(HWND16,LPARAM);
++#endif
++#ifdef _WIN64
++typedef SEGPTR WNDPROC16;
++#else
+ typedef LRESULT (CALLBACK *WNDPROC16)(HWND16,UINT16,WPARAM16,LPARAM);
++#endif
+ 
+ #ifdef WINE_STRICT_PROTOTYPES
++#ifdef _WIN64
++typedef SEGPTR FARPROC16;
++#else
+ typedef LRESULT (CALLBACK *FARPROC16)(void);
++#endif
++#ifdef _WIN64
++typedef SEGPTR PROC16;
++#else
+ typedef INT16   (CALLBACK *PROC16)(void);
++#endif
++#else
++#ifdef _WIN64
++typedef SEGPTR FARPROC16;
+ #else
+ typedef LRESULT (CALLBACK *FARPROC16)();
++#endif
++#ifdef _WIN64
++typedef SEGPTR PROC16;
++#else
+ typedef INT16   (CALLBACK *PROC16)();
+ #endif
++#endif
+ 
+ #endif /* __WINE_WINDEF16_H */
+diff --git a/wine/wine/wingdi16.h b/wine/wine/wingdi16.h
+index 658c9315..396d8559 100644
+--- a/wine/wine/wingdi16.h
++++ b/wine/wine/wingdi16.h
+@@ -270,9 +270,21 @@ typedef struct
+     FONTSIGNATURE       ntmFontSig;
+ } NEWTEXTMETRICEX16,*LPNEWTEXTMETRICEX16;
+ 
++#ifdef _WIN64
++typedef SEGPTR FONTENUMPROC16;
++#else
+ typedef INT16 (CALLBACK *FONTENUMPROC16)(SEGPTR,SEGPTR,UINT16,LPARAM);
++#endif
++#ifdef _WIN64
++typedef SEGPTR LINEDDAPROC16;
++#else
+ typedef VOID  (CALLBACK *LINEDDAPROC16)(INT16,INT16,LPARAM);
++#endif
++#ifdef _WIN64
++typedef SEGPTR GOBJENUMPROC16;
++#else
+ typedef INT16 (CALLBACK *GOBJENUMPROC16)(SEGPTR,LPARAM);
++#endif
+ 
+ 
+ typedef struct
+@@ -311,8 +323,12 @@ typedef struct
+     HMETAFILE16  hMF;
+ } METAFILEPICT16, *LPMETAFILEPICT16;
+ 
++#ifdef _WIN64
++typedef SEGPTR MFENUMPROC16;
++#else
+ typedef INT16 (CALLBACK *MFENUMPROC16)(HDC16,HANDLETABLE16*,METARECORD*,
+                                        INT16,LPARAM);
++#endif
+ typedef struct
+ {
+     INT16    cbSize;
+@@ -322,7 +338,11 @@ typedef struct
+     DWORD    fwType;
+ } DOCINFO16, *LPDOCINFO16;
+ 
++#ifdef _WIN64
++typedef SEGPTR ABORTPROC16;
++#else
+ typedef BOOL16 (CALLBACK *ABORTPROC16)(HDC16, INT16);
++#endif
+ 
+ #define INT_PD_DEFAULT_DEVMODE  1
+ #define INT_PD_DEFAULT_MODEL    2
+diff --git a/wine/wine/winuser16.h b/wine/wine/winuser16.h
+index 1455e543..1481afc9 100644
+--- a/wine/wine/winuser16.h
++++ b/wine/wine/winuser16.h
+@@ -72,7 +72,7 @@ typedef struct tagDCB16
+ 
+ typedef struct
+ {
+-   LPARAM   lParam;
++   LPARAM16   lParam;
+    WPARAM16 wParam;
+    UINT16   message;
+    HWND16   hwnd;
+@@ -80,8 +80,8 @@ typedef struct
+ 
+ typedef struct
+ {
+-  LRESULT       lResult;
+-  LPARAM        lParam;
++  LRESULT16       lResult;
++  LPARAM16        lParam;
+   WPARAM16      wParam;
+   DWORD         message;
+   HWND16        hwnd;
+@@ -135,7 +135,7 @@ typedef struct
+     HWND16    hwnd;
+     UINT16    message;
+     WPARAM16  wParam;
+-    LPARAM    lParam;
++    LPARAM16    lParam;
+     DWORD     time;
+     POINT16   pt;
+ } MSG16, *LPMSG16;
+@@ -189,7 +189,11 @@ typedef struct {
+ } MENUITEMINFO16, *LPMENUITEMINFO16;
+ 
+ /* DrawState defines ... */
++#ifdef _WIN64
++typedef SEGPTR DRAWSTATEPROC16;
++#else
+ typedef BOOL16 (CALLBACK *DRAWSTATEPROC16)(HDC16,LPARAM,WPARAM16,INT16,INT16);
++#endif
+ 
+ /* Listbox messages */
+ #define LB_ADDSTRING16           (WM_USER+1)
+@@ -315,7 +319,7 @@ typedef struct
+     INT16        cx;
+     INT16        cy;
+     DWORD        style;
+-    LPARAM       lParam;
++    LPARAM16       lParam;
+ } MDICREATESTRUCT16, *LPMDICREATESTRUCT16;
+ 
+   /* WM_GETMINMAXINFO struct */
+@@ -392,7 +396,7 @@ typedef struct
+     HWND16    hWnd;
+     UINT16    wMessage;
+     WPARAM16  wParam;
+-    LPARAM    lParam;
++    LPARAM16    lParam;
+ } HARDWAREHOOKSTRUCT16, *LPHARDWAREHOOKSTRUCT16;
+ 
+ /* Scrollbar messages */
+@@ -406,7 +410,11 @@ typedef struct
+ 
+ typedef struct
+ {
++#ifdef _WIN64
++    SEGPTR           lpcs;
++#else
+     CREATESTRUCT16  *lpcs;
++#endif
+     HWND16           hwndInsertAfter;
+ } CBT_CREATEWND16, *LPCBT_CREATEWND16;
+ 
+@@ -421,8 +429,8 @@ typedef struct
+ typedef struct
+ {
+     HMODULE16   hModuleHook;
+-    LPARAM      reserved;
+-    LPARAM      lParam;
++    LPARAM16      reserved;
++    LPARAM16      lParam;
+     WPARAM16    wParam;
+     INT16       code;
+ } DEBUGHOOKINFO16, *LPDEBUGHOOKINFO16;
+diff --git a/winecrt0/exception.c b/winecrt0/exception.c
+index 6a9aae9d..3eeaceb8 100644
+--- a/winecrt0/exception.c
++++ b/winecrt0/exception.c
+@@ -17,7 +17,7 @@
+  * License along with this library; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+-#ifndef _MSC_VER
++#if !defined(_MSC_VER) && !defined(USE_COMPILER_EXCEPTIONS)
+ #include "config.h"
+ #include <stdarg.h>
+ #include "winternl.h"
+diff --git a/winnls/winnls.c b/winnls/winnls.c
+index 6886fd98..5c767aed 100644
+--- a/winnls/winnls.c
++++ b/winnls/winnls.c
+@@ -147,9 +147,9 @@ typedef struct tagIMESTRUCT16 {
+     UINT16   wCount;     // word counter
+     UINT16   dchSource;  // offset to Source from top of memory object
+     UINT16   dchDest;    // offset to Desrination from top of memory object
+-    LPARAM   lParam1;
+-    LPARAM   lParam2;
+-    LPARAM   lParam3;
++    LPARAM16   lParam1;
++    LPARAM16   lParam2;
++    LPARAM16   lParam3;
+ } IMESTRUCT16, *PIMESTRUCT16, NEAR *NPIMESTRUCT16, FAR *LPIMESTRUCT16;
+ C_ASSERT(sizeof(IMESTRUCT16) == 0x16);
+ typedef struct tagIMEMESSAGE16 {

@@ -1,0 +1,325 @@
+From 8ce2932d33387fc293fda2db2ee321f3f10558e9 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:03:34 +0900
+Subject: [PATCH 23/27] arm64: olesvr: 16-bit OLE server structures and handles
+
+- OLESERVER16/OLESERVERDOC16 vtables are tables of 16:16 pointers.
+- Values the 16-bit callbacks store (LPOLEOBJECT, LPOLESERVERDOC,
+  HANDLE16) go through local 16-bit sized variables before being
+  converted for olesvr32.
+- LHSERVER/LHSERVERDOC are LONGs on the 16-bit side; widen and
+  narrow them explicitly.
+- Use HGLOBAL16 for 16-bit global handles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ olesvr/olesvr.c | 110 +++++++++++++++++++++++++++---------------------
+ 1 file changed, 62 insertions(+), 48 deletions(-)
+
+diff --git a/olesvr/olesvr.c b/olesvr/olesvr.c
+index 1bba9f9d..4c30a9f7 100644
+--- a/olesvr/olesvr.c
++++ b/olesvr/olesvr.c
+@@ -177,8 +177,10 @@ OLESTATUS CALLBACK ole_obj_GetData(LPOLEOBJECT obj,OLECLIPFORMAT a,HANDLE *b)
+     WORD args[5];
+     ole_object_wrapper *objw = impl_from_oleobject(obj);
+     LPOLEOBJECTVTBL16 vtbl16 = get_oleobjectvtbl16(objw);
+-    DWORD hndl = MapLS(b);
++    DWORD hndl;
+     DWORD ret;
++    *b = 0; /* the 16-bit callee only stores a HANDLE16 */
++    hndl = MapLS(b);
+     args[4] = HIWORD(objw->obj16);
+     args[3] = LOWORD(objw->obj16);
+     args[2] = LOWORD(a);
+@@ -186,7 +188,7 @@ OLESTATUS CALLBACK ole_obj_GetData(LPOLEOBJECT obj,OLECLIPFORMAT a,HANDLE *b)
+     args[0] = LOWORD(hndl);
+     WOWCallback16Ex(vtbl16->GetData, WCB16_PASCAL, sizeof(args), args, &ret);
+     UnMapLS(hndl);
+-    HGLOBAL16 hmem16 = *b;
++    HGLOBAL16 hmem16 = *(HGLOBAL16 *)b;
+     if (hmem16)
+     {
+         if (a == CF_BITMAP)
+@@ -263,7 +265,7 @@ OLESTATUS CALLBACK ole_obj_SetData(LPOLEOBJECT obj,OLECLIPFORMAT fmt,HANDLE hand
+         if (fmt < 0xc000) FIXME("unknown format %04x\n", fmt);
+         int size = GlobalSize(handle32);
+         void *optr = GlobalLock(handle32);
+-        HGLOBAL hmem = GlobalAlloc16(GMEM_MOVEABLE, size);
++        HGLOBAL16 hmem = GlobalAlloc16(GMEM_MOVEABLE, size);
+         void *nptr = GlobalLock16(hmem);
+         memcpy(nptr, optr, size);
+         GlobalUnlock16(hmem);
+@@ -289,21 +291,22 @@ OLESTATUS CALLBACK ole_obj_SetTargetDevice(LPOLEOBJECT obj,HGLOBAL a)
+     ole_object_wrapper *objw = impl_from_oleobject(obj);
+     LPOLEOBJECTVTBL16 vtbl16 = get_oleobjectvtbl16(objw);
+     DWORD ret;
++    HGLOBAL16 hmem16 = 0;
+     if (a)
+     {
+         int size = GlobalSize(a);
+         void *optr = GlobalLock(a);
+-        HGLOBAL16 hmem16 = GlobalAlloc16(GMEM_MOVEABLE, size);
+-        void *nptr = GlobalLock16(hmem16);
++        void *nptr;
++        hmem16 = GlobalAlloc16(GMEM_MOVEABLE, size);
++        nptr = GlobalLock16(hmem16);
+         memcpy(nptr, optr, size);
+         GlobalUnlock16(hmem16);
+         GlobalUnlock(a);
+         GlobalFree(a);
+-        a = hmem16;
+     }
+     args[2] = HIWORD(objw->obj16);
+     args[1] = LOWORD(objw->obj16);
+-    args[0] = LOWORD(a);
++    args[0] = hmem16;
+     WOWCallback16Ex(vtbl16->SetTargetDevice, WCB16_PASCAL, sizeof(args), args, &ret);
+     return (OLESTATUS)(WORD)ret;
+ }
+@@ -372,7 +375,7 @@ typedef struct _OLESERVERDOCVTBL16 {
+ 
+ typedef struct _OLESERVERDOC16
+ {
+-    const struct _OLESERVERDOCVTBL16 *lpvtbl;
++    SEGPTR lpvtbl; /* const struct _OLESERVERDOCVTBL16 * */
+ } OLESERVERDOC16, *LPOLESERVERDOC16;
+ 
+ typedef struct
+@@ -435,21 +438,24 @@ OLESTATUS CALLBACK ole_doc_SetDocDimensions(LPOLESERVERDOC document, OLE_CONST R
+ OLESTATUS CALLBACK ole_doc_GetObject(LPOLESERVERDOC document, OLE_LPCSTR name, LPOLEOBJECT FAR* object, LPOLECLIENT client)
+ {
+     TRACE("\n");
+-    static OLECLIENTVTBL oleclientvtbl16 = {0};
++    /* 16-bit OLECLIENTVTBL: a single 16:16 CallBack pointer */
++    static SEGPTR oleclientvtbl16;
+     static SEGPTR ptrvtbl16;
+     ole_server_doc_wrapper *doc = impl_from_oleserverdoc(document);
+     LPOLESERVERDOCVTBL16 vtbl16 = get_oleserverdocvtbl16(doc);
+     WORD args[8];
++    SEGPTR object16 = 0; /* the 16-bit callee stores a 16:16 LPOLEOBJECT */
+     DWORD name16 = MapLS(name);
+-    DWORD obj16 = MapLS(object);
++    DWORD obj16 = MapLS(&object16);
+     DWORD cli16 = MapLS(client); // FIXME: this can't be freed until Release
+     DWORD ret;
+-    if (!oleclientvtbl16.CallBack)
++    if (!oleclientvtbl16)
+     {
+-        oleclientvtbl16.CallBack = GetProcAddress16(GetModuleHandle16("OLESVR"), "ITEMCALLBACK");
++        oleclientvtbl16 = GetProcAddress16(GetModuleHandle16("OLESVR"), "ITEMCALLBACK");
+         ptrvtbl16 = MapLS(&oleclientvtbl16);
+     }
+-    client->lpvtbl = ptrvtbl16;
++    /* the 16-bit code reads lpvtbl as a 16:16 pointer */
++    *(SEGPTR *)&client->lpvtbl = ptrvtbl16;
+     args[7] = HIWORD(doc->doc16);
+     args[6] = LOWORD(doc->doc16);
+     args[5] = HIWORD(name16);
+@@ -462,7 +468,7 @@ OLESTATUS CALLBACK ole_doc_GetObject(LPOLESERVERDOC document, OLE_LPCSTR name, L
+     UnMapLS(name16);
+     UnMapLS(obj16);
+     if ((WORD)ret == OLE_OK)
+-        *object = register_oleobject(*object);
++        *object = register_oleobject(object16);
+     return (OLESTATUS)(WORD)ret;
+ }
+ OLESTATUS CALLBACK ole_doc_Release(LPOLESERVERDOC document)
+@@ -508,20 +514,21 @@ static LPOLESERVERDOC register_oleserver_doc(SEGPTR doc16)
+     return doc;
+ }
+ typedef struct _OLESERVER16 *LPOLESERVER16;
++/* 16-bit memory: 16:16 procedure pointers */
+ typedef struct _OLESERVERVTBL16
+ {
+-    OLESTATUS (CALLBACK *Open)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPOLESERVERDOC *);
+-    OLESTATUS (CALLBACK *Create)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPCOLESTR16,LPOLESERVERDOC*);
+-    OLESTATUS (CALLBACK *CreateFromTemplate)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPCOLESTR16,LPCOLESTR16,LPOLESERVERDOC *);
+-    OLESTATUS (CALLBACK *Edit)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPCOLESTR16,LPOLESERVERDOC *);
+-    OLESTATUS (CALLBACK *Exit)(LPOLESERVER);
+-    OLESTATUS (CALLBACK *Release)(LPOLESERVER);
+-    OLESTATUS (CALLBACK *Execute)(LPOLESERVER);
++    SEGPTR Open; /* OLESTATUS (CALLBACK *Open)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPOLESERVERDOC *); */
++    SEGPTR Create; /* OLESTATUS (CALLBACK *Create)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPCOLESTR16,LPOLESERVERDOC*); */
++    SEGPTR CreateFromTemplate; /* OLESTATUS (CALLBACK *CreateFromTemplate)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPCOLESTR16,LPCOLESTR16,LPOLESERVERDOC *); */
++    SEGPTR Edit; /* OLESTATUS (CALLBACK *Edit)(LPOLESERVER,LHSERVERDOC,LPCOLESTR16,LPCOLESTR16,LPOLESERVERDOC *); */
++    SEGPTR Exit; /* OLESTATUS (CALLBACK *Exit)(LPOLESERVER); */
++    SEGPTR Release; /* OLESTATUS (CALLBACK *Release)(LPOLESERVER); */
++    SEGPTR Execute; /* OLESTATUS (CALLBACK *Execute)(LPOLESERVER); */
+ } OLESERVERVTBL16, *LPOLESERVERVTBL16;
+ 
+ typedef struct _OLESERVER16
+ {
+-    const OLESERVERVTBL16 *lpvtbl;
++    SEGPTR lpvtbl; /* const OLESERVERVTBL16 * */
+ } OLESERVER16;
+ 
+ static LONG OLE_current_handle;
+@@ -547,7 +554,8 @@ static OLESTATUS CALLBACK ole_open_callback(LPOLESERVER a, LHSERVERDOC b, OLE_LP
+     WORD args[8];
+     LPOLESERVERVTBL16 vtbl16 = get_oleservervtbl16(server);
+     DWORD doc_name16 = MapLS(doc_name);
+-    DWORD doc16 = MapLS(d);
++    SEGPTR docseg = 0; /* the 16-bit callee stores a 16:16 LPOLESERVERDOC */
++    DWORD doc16 = MapLS(&docseg);
+     DWORD ret;
+     args[7] = HIWORD(server->server16);
+     args[6] = LOWORD(server->server16);
+@@ -561,7 +569,7 @@ static OLESTATUS CALLBACK ole_open_callback(LPOLESERVER a, LHSERVERDOC b, OLE_LP
+     UnMapLS(doc_name16);
+     UnMapLS(doc16);
+     if ((WORD)ret == OLE_OK)
+-        *d = register_oleserver_doc(*d);
++        *d = register_oleserver_doc(docseg);
+     return (OLESTATUS)(WORD)ret;
+ }
+ static OLESTATUS CALLBACK ole_create_callback(LPOLESERVER a, LHSERVERDOC b, OLE_LPCSTR c, OLE_LPCSTR d, LPOLESERVERDOC FAR* e)
+@@ -572,7 +580,8 @@ static OLESTATUS CALLBACK ole_create_callback(LPOLESERVER a, LHSERVERDOC b, OLE_
+     LPOLESERVERVTBL16 vtbl16 = get_oleservervtbl16(server);
+     DWORD doc_name16 = MapLS(d);
+     DWORD class16 = MapLS(c);
+-    DWORD doc16 = MapLS(e);
++    SEGPTR docseg = 0; /* the 16-bit callee stores a 16:16 LPOLESERVERDOC */
++    DWORD doc16 = MapLS(&docseg);
+     DWORD ret;
+     args[9] = HIWORD(server->server16);
+     args[8] = LOWORD(server->server16);
+@@ -589,7 +598,7 @@ static OLESTATUS CALLBACK ole_create_callback(LPOLESERVER a, LHSERVERDOC b, OLE_
+     UnMapLS(class16);
+     UnMapLS(doc16);
+     if ((WORD)ret == OLE_OK)
+-        *e = register_oleserver_doc(*e);
++        *e = register_oleserver_doc(docseg);
+     return (OLESTATUS)(WORD)ret;
+ }
+ static OLESTATUS CALLBACK ole_create_from_template_callback(LPOLESERVER a, LHSERVERDOC b, OLE_LPCSTR c, OLE_LPCSTR d, OLE_LPCSTR e, LPOLESERVERDOC FAR* f)
+@@ -605,7 +614,8 @@ static OLESTATUS CALLBACK ole_edit_callback(LPOLESERVER a, LHSERVERDOC b, OLE_LP
+     LPOLESERVERVTBL16 vtbl16 = get_oleservervtbl16(server);
+     DWORD doc_name16 = MapLS(d);
+     DWORD class16 = MapLS(c);
+-    DWORD doc16 = MapLS(e);
++    SEGPTR docseg = 0; /* the 16-bit callee stores a 16:16 LPOLESERVERDOC */
++    DWORD doc16 = MapLS(&docseg);
+     DWORD ret;
+     args[9] = HIWORD(server->server16);
+     args[8] = LOWORD(server->server16);
+@@ -622,7 +632,7 @@ static OLESTATUS CALLBACK ole_edit_callback(LPOLESERVER a, LHSERVERDOC b, OLE_LP
+     UnMapLS(class16);
+     UnMapLS(doc16);
+     if ((WORD)ret == OLE_OK)
+-        *e = register_oleserver_doc(*e);
++        *e = register_oleserver_doc(docseg);
+     return (OLESTATUS)(WORD)ret;
+ }
+ static OLESTATUS CALLBACK ole_exit_callback(LPOLESERVER a)
+@@ -669,86 +679,90 @@ static OLESERVER *register_oleserver(SEGPTR s16)
+ /******************************************************************************
+  *		OleRegisterServer	[OLESVR.2]
+  */
+-OLESTATUS WINAPI OleRegisterServer16( LPCSTR name, LPOLESERVER16 serverStruct,
+-                                      LHSERVER *hRet, HINSTANCE16 hServer,
++OLESTATUS WINAPI OleRegisterServer16( LPCSTR name, SEGPTR /* LPOLESERVER16 */ serverStruct,
++                                      LONG /* LHSERVER16 */ *hRet, HINSTANCE16 hServer,
+                                       OLE_SERVER_USE use )
+ {
+     OLESERVER *s = register_oleserver(serverStruct);
+-    OLESTATUS status = OleRegisterServer(name, s, hRet, HINSTANCE_32(hServer), use);
++    LHSERVER h = 0;
++    OLESTATUS status = OleRegisterServer(name, s, &h, HINSTANCE_32(hServer), use);
++    *hRet = (LONG)h; /* FIXME ARM64: assumes the 32-bit handle fits in a LONG */
+     return status;
+ }
+ 
+ /******************************************************************************
+  *		OleRevokeServer	[OLESVR.3]
+  */
+-OLESTATUS WINAPI OleRevokeServer16(LHSERVER hServer)
++OLESTATUS WINAPI OleRevokeServer16(LONG hServer)
+ {
+-    return OleRevokeServer(hServer);
++    return OleRevokeServer((LHSERVER)hServer);
+ }
+ 
+ /******************************************************************************
+  *		OleBlockServer	[OLESVR.4]
+  */
+-OLESTATUS WINAPI OleBlockServer16(LHSERVER hServer)
++OLESTATUS WINAPI OleBlockServer16(LONG hServer)
+ {
+-    return OleBlockServer(hServer);
++    return OleBlockServer((LHSERVER)hServer);
+ }
+ 
+ /******************************************************************************
+  *		OleUnblockServer	[OLESVR.5]
+  */
+-OLESTATUS WINAPI OleUnblockServer16(LHSERVER hServer, BOOL16 *block)
++OLESTATUS WINAPI OleUnblockServer16(LONG hServer, BOOL16 *block)
+ {
+     BOOL block32 = *block;
+-    OLESTATUS status = OleUnblockServer(hServer, &block32);
++    OLESTATUS status = OleUnblockServer((LHSERVER)hServer, &block32);
+     *block = block32;
+     return status;
+ }
+ /***********************************************************************
+  *		OleRegisterServerDoc	[OLESVR.6]
+  */
+-OLESTATUS WINAPI OleRegisterServerDoc16( LHSERVER hServer, LPCSTR docname,
++OLESTATUS WINAPI OleRegisterServerDoc16( LONG hServer, LPCSTR docname,
+                                          SEGPTR document,
+-                                         LHSERVERDOC *hRet)
++                                         LONG /* LHSERVERDOC16 */ *hRet)
+ {
+     LPOLESERVERDOC doc32 = register_oleserver_doc(document);
+-    OLESTATUS result = OleRegisterServerDoc(hServer, docname, doc32, hRet);
++    LHSERVERDOC h = 0;
++    OLESTATUS result = OleRegisterServerDoc((LHSERVER)hServer, docname, doc32, &h);
++    *hRet = (LONG)h; /* FIXME ARM64: assumes the 32-bit handle fits in a LONG */
+     return result;
+ }
+ 
+ /******************************************************************************
+  *		OleRevokeServerDoc	[OLESVR.7]
+  */
+-OLESTATUS WINAPI OleRevokeServerDoc16(LHSERVERDOC hServerDoc)
++OLESTATUS WINAPI OleRevokeServerDoc16(LONG hServerDoc)
+ {
+-    return OleRevokeServerDoc(hServerDoc);
++    return OleRevokeServerDoc((LHSERVERDOC)hServerDoc);
+ }
+ 
+ /******************************************************************************
+  *		OleRenameServerDoc	[OLESVR.8]
+  *
+  */
+-OLESTATUS WINAPI OleRenameServerDoc16(LHSERVERDOC hDoc, LPCSTR newName)
++OLESTATUS WINAPI OleRenameServerDoc16(LONG hDoc, LPCSTR newName)
+ {
+-    return OleRenameServerDoc(hDoc, newName);
++    return OleRenameServerDoc((LHSERVERDOC)hDoc, newName);
+ }
+ 
+ /******************************************************************************
+  *		OleRevertServerDoc	[OLESVR.9]
+  *
+  */
+-OLESTATUS WINAPI OleRevertServerDoc16(LHSERVERDOC hDoc)
++OLESTATUS WINAPI OleRevertServerDoc16(LONG hDoc)
+ {
+-    return OleRevertServerDoc(hDoc);
++    return OleRevertServerDoc((LHSERVERDOC)hDoc);
+ }
+ 
+ /******************************************************************************
+  *		OleSavedServerDoc	[OLESVR.10]
+  *
+  */
+-OLESTATUS WINAPI OleSavedServerDoc16(LHSERVERDOC hDoc)
++OLESTATUS WINAPI OleSavedServerDoc16(LONG hDoc)
+ {
+-    return OleSavedServerDoc(hDoc);
++    return OleSavedServerDoc((LHSERVERDOC)hDoc);
+ }
+ 
+ OLESTATUS WINAPI OleRevokeObject16(LPOLECLIENT client)

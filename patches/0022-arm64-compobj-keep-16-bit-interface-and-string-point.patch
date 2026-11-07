@@ -1,0 +1,194 @@
+From 74760acd4ab99ad5f4fb8da70ad49bbc55bd8af7 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:03:34 +0900
+Subject: [PATCH 22/27] arm64: compobj: keep 16-bit interface and string
+ pointers as SEGPTR
+
+- IMalloc16 constructor and task allocator are SEGPTRs, vtable entries
+  are FARPROC16s.
+- CoGetClassObject16, StringFromCLSID16, ProgIDFromCLSID16 write
+  SEGPTRs to 16-bit memory instead of 64-bit pointers.
+- IMalloc16 QueryInterface returned a flat pointer to 16-bit code;
+  return a mapped 16:16 pointer.
+- Ignore a 16-bit COSERVERINFO on _WIN64 (16:16 pointers inside).
+- typelib: SEGPTR initialised with 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ compobj/compobj.c | 49 ++++++++++++++++++++++++++++-------------------
+ typelib/typelib.c |  2 +-
+ 2 files changed, 30 insertions(+), 21 deletions(-)
+
+diff --git a/compobj/compobj.c b/compobj/compobj.c
+index 48ec9059..42d4ffd2 100644
+--- a/compobj/compobj.c
++++ b/compobj/compobj.c
+@@ -81,7 +81,8 @@ HRESULT CDECL IMalloc16_fnQueryInterface(IMalloc16* iface,REFIID refiid,LPVOID *
+ 	if (	!memcmp(&IID_IUnknown,refiid,sizeof(IID_IUnknown)) ||
+ 		!memcmp(&IID_IMalloc,refiid,sizeof(IID_IMalloc))
+ 	) {
+-		*obj = This;
++		/* obj is 16-bit memory: return a 16:16 interface pointer, not a flat one */
++		*(SEGPTR *)obj = MapLS(iface);
+ 		return 0;
+ 	}
+ 	return OLE_E_ENUM_NOMORE;
+@@ -173,10 +174,10 @@ DWORD CDECL IMalloc16_fnGetSize(IMalloc16* iface,SEGPTR pv)
+ /******************************************************************************
+  * IMalloc16_DidAlloc [COMPOBJ.507]
+  */
+-INT16 CDECL IMalloc16_fnDidAlloc(IMalloc16* iface,LPVOID pv) {
++INT16 CDECL IMalloc16_fnDidAlloc(IMalloc16* iface,SEGPTR pv) {
+         IMalloc16Impl *This = impl_from_IMalloc16(iface);
+ 
+-	TRACE_(olemalloc)("(%p)->DidAlloc(%p)\n",This,pv);
++	TRACE_(olemalloc)("(%p)->DidAlloc(%08x)\n",This,pv);
+ 	return (INT16)-1;
+ }
+ 
+@@ -193,7 +194,7 @@ LPVOID CDECL IMalloc16_fnHeapMinimize(IMalloc16* iface) {
+ /******************************************************************************
+  * IMalloc16_Constructor [VTABLE]
+  */
+-static LPMALLOC16
++static SEGPTR /* LPMALLOC16 */
+ IMalloc16_Constructor(void)
+ {
+     static IMalloc16Vtbl vt16;
+@@ -204,7 +205,7 @@ IMalloc16_Constructor(void)
+     This = HeapAlloc( GetProcessHeap(), 0, sizeof(IMalloc16Impl) );
+     if (!msegvt16)
+     {
+-#define VTENT(x) vt16.x = (void*)GetProcAddress16(hcomp,"IMalloc16_"#x);assert(vt16.x)
++#define VTENT(x) vt16.x = GetProcAddress16(hcomp,"IMalloc16_"#x);assert(vt16.x)
+         VTENT(QueryInterface);
+         VTENT(AddRef);
+         VTENT(Release);
+@@ -217,9 +218,9 @@ IMalloc16_Constructor(void)
+ #undef VTENT
+         msegvt16 = MapLS( &vt16 );
+     }
+-    This->IMalloc16_iface.lpVtbl = (const IMalloc16Vtbl*)msegvt16;
++    This->IMalloc16_iface.lpVtbl = msegvt16;
+     This->ref = 1;
+-    return (LPMALLOC16)MapLS( This );
++    return MapLS( This );
+ }
+ 
+ 
+@@ -331,7 +332,7 @@ HRESULT WINAPI CoInitialize16(
+     {
+         lpReserved = IMalloc16_Constructor();
+     }
+-    d->malloc16 = (LPMALLOC16)lpReserved;
++    d->malloc16 = lpReserved;
+     TRACE("IMalloc->QueryInterface: %08x\n", GET_SEGPTR_METHOD_ADDR(IMalloc16, lpReserved, QueryInterface));
+     TRACE("IMalloc->AddRef: %08x\n", GET_SEGPTR_METHOD_ADDR(IMalloc16, lpReserved, AddRef));
+     TRACE("IMalloc->Release: %08x\n", GET_SEGPTR_METHOD_ADDR(IMalloc16, lpReserved, Release));
+@@ -512,20 +513,20 @@ error:
+  */
+ static HRESULT
+ _xmalloc16(DWORD size, SEGPTR *ptr) {
+-  LPMALLOC16 mllc;
++  SEGPTR mllc; /* LPMALLOC16 */
+   DWORD args[2];
+ 
+   if (get_task_imalloc16(&mllc))
+     return E_OUTOFMEMORY;
+ 
+-  args[0] = (DWORD)mllc;
++  args[0] = mllc;
+   args[1] = size;
+   /* No need for a Callback entry, we have WOWCallback16Ex which does
+    * everything we need.
+    */
+   if (!WOWCallback16Ex(
+-      (DWORD)((const IMalloc16Vtbl*)MapSL(
+-	  (SEGPTR)((LPMALLOC16)MapSL((SEGPTR)mllc))->lpVtbl  )
++      ((const IMalloc16Vtbl*)MapSL(
++	  ((const IMalloc16*)MapSL(mllc))->lpVtbl  )
+       )->Alloc,
+       WCB16_CDECL,
+       2*sizeof(DWORD),
+@@ -550,16 +551,16 @@ _xmalloc16(DWORD size, SEGPTR *ptr) {
+ 
+ HRESULT WINAPI StringFromCLSID16(
+   REFCLSID id,		/* [in] the GUID to be converted */
+-  LPOLESTR16 *idstr )	/* [out] a pointer to a to-be-allocated segmented pointer pointing to the resulting string */
++  SEGPTR /* LPOLESTR16 */ *idstr )	/* [out] a pointer to a to-be-allocated segmented pointer pointing to the resulting string */
+ {
+     WCHAR buffer[40];
+     HRESULT ret;
+ 
+-    ret = _xmalloc16(40,(SEGPTR*)idstr);
++    ret = _xmalloc16(40,idstr);
+     if (ret != S_OK)
+         return ret;
+     StringFromGUID2( id, buffer, 40 );
+-    WideCharToMultiByte( CP_ACP, 0, buffer, -1, MapSL((SEGPTR)*idstr), 40, NULL, NULL );
++    WideCharToMultiByte( CP_ACP, 0, buffer, -1, MapSL(*idstr), 40, NULL, NULL );
+     return ret;
+ }
+ 
+@@ -574,7 +575,7 @@ HRESULT WINAPI StringFromCLSID16(
+  */
+ HRESULT WINAPI ProgIDFromCLSID16(
+   REFCLSID clsid, /* [in] class id as found in registry */
+-  LPOLESTR16 *lplpszProgID )/* [out] associated Program ID */
++  SEGPTR /* LPOLESTR16 */ *lplpszProgID )/* [out] associated Program ID */
+ {
+     LPOLESTR progid;
+     HRESULT ret;
+@@ -587,9 +588,9 @@ HRESULT WINAPI ProgIDFromCLSID16(
+     if (ret == S_OK)
+     {
+         INT len = WideCharToMultiByte( CP_ACP, 0, progid, -1, NULL, 0, NULL, NULL );
+-        ret = _xmalloc16(len, (SEGPTR*)lplpszProgID);
++        ret = _xmalloc16(len, lplpszProgID);
+         if (ret == S_OK)
+-            WideCharToMultiByte( CP_ACP, 0, progid, -1, MapSL((SEGPTR)*lplpszProgID), len, NULL, NULL );
++            WideCharToMultiByte( CP_ACP, 0, progid, -1, MapSL(*lplpszProgID), len, NULL, NULL );
+         CoTaskMemFree( progid );
+     }
+     else
+@@ -840,7 +841,7 @@ HRESULT WINAPI CoGetClassObject16(
+     SEGPTR rclsid, DWORD dwClsContext, COSERVERINFO *pServerInfo,
+     SEGPTR riid, SEGPTR ppv)
+ {
+-    LPVOID *ppvl = MapSL(ppv);
++    SEGPTR *ppvl = MapSL(ppv); /* 16-bit memory */
+     char idstr[CHARS_IN_GUID];
+     char buf_key[CHARS_IN_GUID+190], dllpath[MAX_PATH+1];
+     LONG dllpath_len = sizeof(dllpath);
+@@ -848,9 +849,17 @@ HRESULT WINAPI CoGetClassObject16(
+ 
+     TRACE("CLSID: %s, IID: %s\n", debugstr_guid(MapSL(rclsid)), debugstr_guid(MapSL(riid)));
+ 
+-    *ppvl = NULL;
++    *ppvl = 0;
+     StringFromGUID216(MapSL(rclsid), idstr, CHARS_IN_GUID);
+ 
++#ifdef _WIN64
++    if (pServerInfo) {
++        /* FIXME ARM64: a 16-bit COSERVERINFO holds 16:16 pointers, not 64-bit ones */
++        FIXME("ignoring 16-bit COSERVERINFO %p\n", pServerInfo);
++        pServerInfo = NULL;
++    }
++#endif
++
+     if (pServerInfo) {
+         FIXME("pServerInfo->name=%s pAuthInfo=%p\n",
+               debugstr_w(pServerInfo->pwszName), pServerInfo->pAuthInfo);
+diff --git a/typelib/typelib.c b/typelib/typelib.c
+index 5d90940e..5a3a7d72 100644
+--- a/typelib/typelib.c
++++ b/typelib/typelib.c
+@@ -234,7 +234,7 @@ HRESULT WINAPI LoadRegTypeLib16(REFGUID guid, unsigned short wVerMajor, unsigned
+ {
+     ITypeLib *ptlib = NULL;
+     HRESULT result;
+-    SEGPTR bstr16 = NULL;
++    SEGPTR bstr16 = 0;
+     if (SUCCEEDED(QueryPathOfRegTypeLib16(guid, wVerMajor, wVerMinor, lcid, &bstr16)))
+     {
+         result = LoadTypeLib16((LPSTR)MapSL(bstr16), lplptlib);

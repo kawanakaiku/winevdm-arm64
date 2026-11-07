@@ -1,0 +1,419 @@
+From 96ac73f0cf8263b187237c0d7ea9aecff73f783a Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 10:07:31 +0900
+Subject: [PATCH 21/27] arm64: ole2: fix 64-bit conversions in the interface
+ thunks
+
+- STATSTG16.pwcsName is a SEGPTR on _WIN64 (ole2 and storage ifs.h).
+- Declare map_pformatetc16_32/32_16, take a SEGPTR in map_vardesc32.
+- HTASK_32 gives a thread id; HFONT/HRGN are 16-bit handles in the
+  16-bit interfaces; HOLEMENU16 entry points take HGLOBAL16.
+- Fix MAP_LPCRECTL32_16 mapping the uninitialised 16-bit value.
+- HGLOBALStreamImpl16_CopyTo passed a flat buffer to IStream16_Write;
+  pass a mapped SEGPTR.
+- Use 0 instead of NULL for SEGPTR values, drop pointer casts on
+  16-bit vtable entries.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ole2/hglobalstream.c | 11 +++++++----
+ ole2/ifs.h           |  4 ++++
+ ole2/ifs_thunk.c     | 30 ++++++++++++++++--------------
+ ole2/ifs_thunk.h     | 14 ++++++++------
+ ole2/memlockbytes.c  |  6 +++---
+ ole2/ole2.c          | 20 ++++++++++----------
+ storage/ifs.h        |  4 ++++
+ storage/storage.c    |  4 ++++
+ 8 files changed, 56 insertions(+), 37 deletions(-)
+
+diff --git a/ole2/hglobalstream.c b/ole2/hglobalstream.c
+index 433d1a10..a3ba271e 100644
+--- a/ole2/hglobalstream.c
++++ b/ole2/hglobalstream.c
+@@ -133,7 +133,7 @@ ULONG CDECL HGLOBALStreamImpl16_Release(
+     if (This->deleteOnRelease)
+     {
+       GlobalFree16(This->supportHandle);
+-      This->supportHandle = NULL;
++      This->supportHandle = 0;
+     }
+ 
+     HeapFree(GetProcessHeap(), 0, This);
+@@ -448,7 +448,10 @@ HRESULT CDECL HGLOBALStreamImpl16_CopyTo(
+ 
+     if (bytesRead)
+     {
+-        hr = IStream16_Write(pstm, tmpBuffer, bytesRead, MapLS(&bytesWritten));
++        SEGPTR segbuf = MapLS(tmpBuffer), segwritten = MapLS(&bytesWritten);
++        hr = IStream16_Write(pstm, segbuf, bytesRead, segwritten);
++        UnMapLS(segbuf);
++        UnMapLS(segwritten);
+         if (FAILED(hr))
+             break;
+ 
+@@ -547,7 +550,7 @@ HRESULT CDECL HGLOBALStreamImpl16_Stat(
+ 
+   memset(pstatstg, 0, sizeof(STATSTG16));
+ 
+-  pstatstg->pwcsName = NULL;
++  pstatstg->pwcsName = 0;
+   pstatstg->type     = STGTY_STREAM;
+   pstatstg->cbSize   = This->streamSize;
+ 
+@@ -593,7 +596,7 @@ HRESULT WINAPI CreateStreamOnHGlobal16(
+   if (!SegHGLOBALStreamImplVtbl)
+   {
+       HMODULE16 hole = GetModuleHandle16("OLE2");
+-#define VTENT(x) HGLOBALStreamImplVtbl.x = (void*)GetProcAddress16(hole,"HGLOBALStreamImpl16_"#x);assert(HGLOBALStreamImplVtbl.x)
++#define VTENT(x) HGLOBALStreamImplVtbl.x = GetProcAddress16(hole,"HGLOBALStreamImpl16_"#x);assert(HGLOBALStreamImplVtbl.x)
+       VTENT(QueryInterface);
+       VTENT(AddRef);
+       VTENT(Release);
+diff --git a/ole2/ifs.h b/ole2/ifs.h
+index a94bea71..c1cfbf09 100644
+--- a/ole2/ifs.h
++++ b/ole2/ifs.h
+@@ -91,7 +91,11 @@ typedef struct tagSAFEARRAYBOUND16
+ } SAFEARRAYBOUND16;
+ typedef struct tagSTATSTG16
+ {
++#ifdef _WIN64
++    SEGPTR pwcsName; /* LPOLESTR16 */
++#else
+     LPOLESTR16 pwcsName;
++#endif
+     DWORD type;
+     ULARGE_INTEGER cbSize;
+     FILETIME mtime;
+diff --git a/ole2/ifs_thunk.c b/ole2/ifs_thunk.c
+index 2bba1066..529de0a5 100644
+--- a/ole2/ifs_thunk.c
++++ b/ole2/ifs_thunk.c
+@@ -543,7 +543,7 @@ void map_pformatetc16_32(FORMATETC *a32, const FORMATETC16 *a16)
+ void map_pformatetc32_16(FORMATETC16 *a16, const FORMATETC *a32)
+ {
+     a16->cfFormat = a32->cfFormat;
+-    a16->ptd = a32->ptd ? MapLS(DVTARGETDEVICE32WTo16(a32->ptd)) : NULL;
++    a16->ptd = a32->ptd ? MapLS(DVTARGETDEVICE32WTo16(a32->ptd)) : 0;
+     a16->dwAspect = a32->dwAspect;
+     a16->lindex = a32->lindex;
+     a16->tymed = a32->tymed;
+@@ -862,7 +862,7 @@ void map_bstr32_16(SEGPTR *a16, const BSTR *a32)
+     }
+     len = SysStringLen(*a32);
+     len16 = WideCharToMultiByte(CP_ACP, 0, *a32, len, NULL, 0, NULL, NULL);
+-    *a16 = dynamic_SysAllocStringLen16(NULL, len16);
++    *a16 = dynamic_SysAllocStringLen16(0, len16);
+     WideCharToMultiByte(CP_ACP, 0, *a32, len, MapSL(*a16), len16, NULL, NULL);
+ }
+ 
+@@ -1242,7 +1242,7 @@ TYPEATTR16 *map_typeattr32_16(const TYPEATTR *a32)
+     a16->dwReserved = a32->dwReserved;
+     a16->memidConstructor = a32->memidConstructor;
+     a16->memidDestructor = a32->memidDestructor;
+-    a16->lpstrSchema = a32->lpstrSchema /* FIXME? */;
++    a16->lpstrSchema = (SEGPTR)(ULONG_PTR)a32->lpstrSchema /* FIXME? reserved, normally NULL */;
+     a16->typekind = a32->typekind;
+     a16->cFuncs = a32->cFuncs;
+     a16->cVars = a32->cVars;
+@@ -1300,16 +1300,16 @@ void STDMETHODCALLTYPE ITypeInfo_32_16_ReleaseTypeAttr(ITypeInfo *This, TYPEATTR
+ }
+ #endif
+ 
+-VARDESC *map_vardesc32(const VARDESC16 *a16)
++VARDESC *map_vardesc32(SEGPTR seg16)
+ {
+     VARDESC *a32 = (VARDESC*)HeapAlloc(GetProcessHeap(), 0, sizeof(VARDESC));
+-    a16 = (VARDESC16 *)MapSL(a16);
++    const VARDESC16 *a16 = (const VARDESC16 *)MapSL(seg16);
+     a32->memid = a16->memid;
+-    a32->lpstrSchema = a16->lpstrSchema;
++    a32->lpstrSchema = (LPOLESTR)(ULONG_PTR)a16->lpstrSchema; /* FIXME? reserved, normally NULL */
+     map_elemdesc16_32(&a32->elemdescVar, &a16->elemdescVar);
+     a32->wVarFlags = a16->wVarFlags;
+     a32->varkind = a16->varkind;
+-    a32->lpvarValue = 0xcafebabe;
++    a32->lpvarValue = (VARIANT *)(ULONG_PTR)0xcafebabe;
+     if (a16->varkind == VAR_CONST)
+     {
+         FIXME("VAR_CONST\n");
+@@ -1338,7 +1338,7 @@ VARDESC16 *map_vardesc16(const VARDESC *a32)
+     w->magic = VARDESC16_WRAPPER_MAGIC;
+     w->desc32 = a32;
+     a16->memid = a32->memid;
+-    a16->lpstrSchema = a32->lpstrSchema;
++    a16->lpstrSchema = (SEGPTR)(ULONG_PTR)a32->lpstrSchema; /* FIXME? reserved, normally NULL */
+     map_elemdesc32_16(&a16->elemdescVar, &a32->elemdescVar);
+     a16->wVarFlags = a32->wVarFlags;
+     a16->varkind = a32->varkind;
+@@ -1375,7 +1375,7 @@ void map_bindptr16_32(BINDPTR *a32, const BINDPTR16 *a16, const DESCKIND kind)
+         break;
+     case DESCKIND_VARDESC:
+         TRACE("DESCKIND_VARDESC\n");
+-        a32->lpvardesc = map_vardesc32((VARDESC16*)MapSL(a16->lpvardesc));
++        a32->lpvardesc = map_vardesc32(a16->lpvardesc);
+         break;
+     case DESCKIND_FUNCDESC:
+         TRACE("DESCKIND_FUNCDESC\n");
+@@ -1387,7 +1387,7 @@ void map_bindptr16_32(BINDPTR *a32, const BINDPTR16 *a16, const DESCKIND kind)
+         break;
+     case DESCKIND_IMPLICITAPPOBJ:
+         TRACE("DESCKIND_IMPLICITAPPOBJ\n");
+-        a32->lpvardesc = map_vardesc32((VARDESC16*)MapSL(a16->lpvardesc));
++        a32->lpvardesc = map_vardesc32(a16->lpvardesc);
+         break;
+     default:
+         FIXME("unknown DESCKIND %d\n", kind);
+@@ -1914,7 +1914,7 @@ void map_excepinfo16_32(EXCEPINFO *a32, const EXCEPINFO16 *a16)
+     map_bstr16_32(&a32->bstrDescription, &a16->bstrDescription);
+     map_bstr16_32(&a32->bstrHelpFile, &a16->bstrHelpFile);
+     a32->wReserved = a16->dwHelpContext;
+-    a32->pvReserved = a16->pvReserved;
++    a32->pvReserved = (PVOID)(ULONG_PTR)a16->pvReserved; /* reserved, passed through */
+     if (a16->pfnDeferredFillIn)
+         ERR("pfnDeferredFillIn\n");
+     a32->pfnDeferredFillIn = 0;
+@@ -1929,7 +1929,7 @@ void map_excepinfo32_16(EXCEPINFO16 *a16, const EXCEPINFO *a32)
+     map_bstr32_16(&a16->bstrDescription, &a32->bstrDescription);
+     map_bstr32_16(&a16->bstrHelpFile, &a32->bstrHelpFile);
+     a16->wReserved = a32->dwHelpContext;
+-    a16->pvReserved = a32->pvReserved;
++    a16->pvReserved = (SEGPTR)(ULONG_PTR)a32->pvReserved; /* reserved, passed through */
+     if (a32->pfnDeferredFillIn)
+         ERR("pfnDeferredFillIn\n");
+     a16->pfnDeferredFillIn = 0;
+@@ -2008,7 +2008,8 @@ HRESULT CDECL ITypeInfo_16_32_Invoke(SEGPTR This, SEGPTR args16_pvInstance, DWOR
+     UINT args32_puArgErr = { 0 };
+     /**/
+     /* MAP_PVOID16_32(args32_pvInstance, args16_pvInstance); */
+-    args32_pvInstance = args16_pvInstance;
++    /* passed through as a 16:16 pointer (see ITypeInfo_fnInvoke16) */
++    args32_pvInstance = (PVOID)(ULONG_PTR)args16_pvInstance;
+     /**/
+     MAP_MEMBERID16_32(args32_memid, args16_memid);
+     MAP_WORD16_32(args32_wFlags, args16_wFlags);
+@@ -2057,7 +2058,8 @@ HRESULT CDECL ITypeInfo_16_32_AddressOfMember(SEGPTR This, DWORD args16_memid, W
+     UNMAP_INVOKEKIND16_32(args32_invKind, args16_invKind);
+     if (args16_ppv)
+     {
+-        (*(TYP16_PVOID*)MapSL(args16_ppv)) = args32_ppv;
++        /* FIXME ARM64: a 32-bit address is returned to 16-bit code as is */
++        (*(TYP16_PVOID*)MapSL(args16_ppv)) = (TYP16_PVOID)(ULONG_PTR)args32_ppv;
+         /*MAP_PVOID32_16((*(TYP16_PVOID*)MapSL(args16_ppv)), args32_ppv);*/
+     }
+     return result16__;
+diff --git a/ole2/ifs_thunk.h b/ole2/ifs_thunk.h
+index ca9ece3b..63b4e9a1 100644
+--- a/ole2/ifs_thunk.h
++++ b/ole2/ifs_thunk.h
+@@ -238,6 +238,8 @@ ULONG WINAPI ISTGMEDIUMRelease_32_16_Release(ISTGMEDIUMRelease *iface);
+ #define UNMAP_LPINTERFACEINFO16_32
+ #define UNMAP_PTR_STGMEDIUM32_16
+ #define UNMAP_PTR_STGMEDIUM16_32
++void map_pformatetc16_32(FORMATETC *a32, const FORMATETC16 *a16);
++void map_pformatetc32_16(FORMATETC16 *a16, const FORMATETC *a32);
+ #define MAP_PTR_FORMATETC16_32(a32, a16) map_pformatetc16_32(a32 = (FORMATETC*)alloca(sizeof(FORMATETC)), (FORMATETC16*)MapSL(a16))
+ #define MAP_PTR_FORMATETC32_16(a16, a32) map_pformatetc32_16((FORMATETC16*)MapSL(a16 = MapLS(alloca(sizeof(FORMATETC16)))), a32);
+ 
+@@ -248,7 +250,7 @@ ULONG WINAPI ISTGMEDIUMRelease_32_16_Release(ISTGMEDIUMRelease *iface);
+ #define MAP_FORMATETC32_16(a16, a32) map_formatetc32_16((FORMATETC16*)&a16, &a32)
+ #define MAP_FORMATETC16_32(a32, a16) map_formatetc16_32(&a32, (FORMATETC16*)&a16) 
+ 
+-#define MAP_HTASK16_32(a32, a16) a32 = HTASK_32(a16)
++#define MAP_HTASK16_32(a32, a16) a32 = (HTASK)(ULONG_PTR)HTASK_32(a16) /* a thread id */
+ #define MAP_HTASK32_16(a16, a32) a16 = HTASK_16(a32)
+ #define MAP_HDC16_32(a32, a16) a32 = HDC_32(a16)
+ #define MAP_HDC32_16(a16, a32) a16 = HDC_16(a32)
+@@ -379,7 +381,7 @@ static void map_rect16_32(RECT *a32, RECT16 *a16)
+ #define MAP_STRUCT_tagOleMenuGroupWidths16_32(a32, a16) \
+ a32 = *(struct tagOleMenuGroupWidths*)&a16
+ #define MAP_LPCRECTL16_32(a32, a16) a32 = (LPCRECTL)MapSL(a16)
+-#define MAP_LPCRECTL32_16(a16, a32) a16 = MapLS(a16)
++#define MAP_LPCRECTL32_16(a16, a32) a16 = MapLS(a32)
+ 
+ #define MAP_STRUCT_tagOleInPlaceFrameInfo32_16(a16, a32) map_oleinplaceframeinfo32_16((struct TYP16_tagOleInPlaceFrameInfo*)&a16, &a32)
+ #define MAP_STRUCT_tagOleInPlaceFrameInfo16_32(a32, a16) map_oleinplaceframeinfo16_32(&a32, &a16)
+@@ -443,7 +445,7 @@ static inline void map_statdata32_16(STATDATA16* a16, const STATDATA *a32)
+ {
+     map_formatetc32_16(&a16->formatetc, &a32->formatetc);
+     a16->advf = a32->advf;
+-    a16->pAdvSink = (IAdviseSink*)iface32_16(&IID_IAdviseSink, a32->pAdvSink);
++    a16->pAdvSink = iface32_16(&IID_IAdviseSink, a32->pAdvSink);
+     a16->dwConnection = a32->dwConnection;
+ }
+ static inline void map_statdata16_32(STATDATA* a32, const STATDATA16 *a16)
+@@ -566,8 +568,8 @@ typedef USHORT TYP16_USHORT;
+ typedef BYTE TYP16_BYTE;
+ typedef SEGPTR TYP16_PVOID;
+ typedef SHORT TYP16_SHORT;
+-typedef HFONT TYP16_HFONT;
+-typedef HRGN TYP16_HRGN;
++typedef HFONT16 TYP16_HFONT;
++typedef HRGN16 TYP16_HRGN;
+ typedef CY TYP16_CY;
+ typedef WORD TYP16_TYPEKIND;
+ typedef UINT16 TYP16_OLE_HANDLE;
+@@ -849,7 +851,7 @@ TYPEATTR16 *map_typeattr32_16(const TYPEATTR *a32);
+ #define MAP_PTR_TYPEATTR32_16(a16, a32) a16 = MapLS(map_typeattr32_16(a32))
+ #define MAP_PTR_TYPEDESC16_32(a32, a16) FIXME("MAP_PTR_TYPEDESC16_32\n")
+ #define MAP_PTR_TYPEDESC32_16(a16, a32) FIXME("MAP_PTR_TYPEDESC32_16\n")
+-VARDESC *map_vardesc32(const VARDESC16 *a16);
++VARDESC *map_vardesc32(SEGPTR a16);
+ #define MAP_PTR_VARDESC16_32(a32, a16) a32 = map_vardesc32(a16)
+ VARDESC16 *map_vardesc16(const VARDESC *a32);
+ #define MAP_PTR_VARDESC32_16(a16, a32) a16 = MapLS(map_vardesc16(a32))
+diff --git a/ole2/memlockbytes.c b/ole2/memlockbytes.c
+index 07e18390..6fa4bd58 100644
+--- a/ole2/memlockbytes.c
++++ b/ole2/memlockbytes.c
+@@ -111,7 +111,7 @@ HGLOBALLockBytesImpl16_Construct(HGLOBAL16 hGlobal,
+   if (!msegvt16)
+   {
+       HMODULE16 hcomp = GetModuleHandle16("OLE2");
+-#define VTENT(x) vt16.x = (void*)GetProcAddress16(hcomp,"HGLOBALLockBytesImpl16_"#x);assert(vt16.x)
++#define VTENT(x) vt16.x = GetProcAddress16(hcomp,"HGLOBALLockBytesImpl16_"#x);assert(vt16.x)
+       VTENT(QueryInterface);
+       VTENT(AddRef);
+       VTENT(Release);
+@@ -125,7 +125,7 @@ HGLOBALLockBytesImpl16_Construct(HGLOBAL16 hGlobal,
+ #undef VTENT
+       msegvt16 = MapLS( &vt16 );
+   }
+-  newLockBytes->ILockBytes16_iface.lpVtbl = (const ILockBytes16Vtbl*)msegvt16;
++  newLockBytes->ILockBytes16_iface.lpVtbl = msegvt16;
+   newLockBytes->ref = 0;
+   /*
+    * Initialize the support.
+@@ -491,7 +491,7 @@ HRESULT CDECL HGLOBALLockBytesImpl16_Stat(
+ 
+   memset(pstatstg, 0, sizeof(STATSTG16));
+ 
+-  pstatstg->pwcsName = NULL;
++  pstatstg->pwcsName = 0;
+   pstatstg->type     = STGTY_LOCKBYTES;
+   pstatstg->cbSize   = This->byteArraySize;
+ 
+diff --git a/ole2/ole2.c b/ole2/ole2.c
+index 1a570c06..4e4e6320 100644
+--- a/ole2/ole2.c
++++ b/ole2/ole2.c
+@@ -246,14 +246,14 @@ HRESULT WINAPI CreateItemMoniker16(LPCOLESTR16 lpszDelim,LPCOLESTR16 lpszItem,SE
+  *  hOleMenu  FIXME: Should probably be an HOLEMENU16.
+  */
+ HRESULT WINAPI OleSetMenuDescriptor16(
+-    HOLEMENU16             hOleMenu,
++    HGLOBAL16              hOleMenu, /* HOLEMENU16, a 16-bit handle */
+     HWND16                 hwndFrame,
+     HWND16                 hwndActiveObject,
+  /* LPOLEINPLACEFRAME */ SEGPTR lpFrame,
+  /* LPOLEINPLACEACTIVEOBJECT */ SEGPTR lpActiveObject)
+ {
+     HOLEMENU hOleMenu32;
+-    TRACE("(%p, %x, %x, %p, %p)\n", hOleMenu, hwndFrame, hwndActiveObject, lpFrame, lpActiveObject);
++    TRACE("(%04x, %x, %x, %08x, %08x)\n", hOleMenu, hwndFrame, hwndActiveObject, lpFrame, lpActiveObject);
+     hOleMenu32 = HWND_32(hOleMenu); /* FIXME */
+     return hresult32_16(OleSetMenuDescriptor(hOleMenu32, HWND_32(hwndFrame), HWND_32(hwndActiveObject),
+         (IOleInPlaceFrame*)iface16_32(&IID_IOleInPlaceFrame, lpFrame),
+@@ -681,14 +681,14 @@ BOOL WINAPI OleIsRunning16(SEGPTR pOleObject)
+     return hresult32_16(OleIsRunning((IOleObject*)iface16_32(&IID_IOleObject, pOleObject)));
+ }
+ 
+-HOLEMENU16 WINAPI OleCreateMenuDescriptor16(HMENU16 hmenu, LPOLEMENUGROUPWIDTHS width)
++HGLOBAL16 /* HOLEMENU16 */ WINAPI OleCreateMenuDescriptor16(HMENU16 hmenu, LPOLEMENUGROUPWIDTHS width)
+ {
+     HOLEMENU om32 = OleCreateMenuDescriptor(HMENU_32(hmenu), width);
+     /* FIXME! */
+     return HWND_16(om32);
+ }
+ 
+-void WINAPI OleDestroyMenuDescriptor16(HOLEMENU16 olemenu)
++void WINAPI OleDestroyMenuDescriptor16(HGLOBAL16 /* HOLEMENU16 */ olemenu)
+ {
+     /* FIXME! */
+     OleDestroyMenuDescriptor(HWND_32(olemenu));
+@@ -728,7 +728,7 @@ HRESULT WINAPI OleSave16(SEGPTR pPS, SEGPTR pStg, BOOL fSameAsLoad)
+ }
+ 
+ 
+-HRESULT WINAPI OleCreate16(REFCLSID rclsid, REFIID riid, DWORD renderopt, LPFORMATETC16 pFormatetc, SEGPTR pClientSite, SEGPTR lpStg, SEGPTR *ppvObj)
++HRESULT WINAPI OleCreate16(REFCLSID rclsid, REFIID riid, DWORD renderopt, FORMATETC16 *pFormatetc, SEGPTR pClientSite, SEGPTR lpStg, SEGPTR *ppvObj)
+ {
+     HRESULT result;
+     FORMATETC formatetc32;
+@@ -805,7 +805,7 @@ HRESULT WINAPI OleQueryCreateFromData16(SEGPTR pDataObject)
+     return hresult32_16(OleQueryCreateFromData((IDataObject*)iface16_32(&IID_IDataObject, pDataObject)));
+ }
+ 
+-HRESULT WINAPI OleTranslateAccelerator16(SEGPTR lpFrame, LPOLEINPLACEFRAMEINFO16 lpFrameInfo, LPMSG16 lpmsg16)
++HRESULT WINAPI OleTranslateAccelerator16(SEGPTR lpFrame, struct TYP16_tagOleInPlaceFrameInfo *lpFrameInfo, LPMSG16 lpmsg16)
+ {
+     MSG msg32;
+     HRESULT result;
+@@ -855,7 +855,7 @@ SEGPTR CoTaskMemAlloc16(DWORD size)
+     SEGPTR imalloc = 0;
+     if (FAILED(dynamic_get_task_imalloc16(&imalloc)))
+         return 0;
+-    return IMalloc16_Alloc(imalloc, size);
++    return (SEGPTR)(ULONG_PTR)IMalloc16_Alloc(imalloc, size); /* a 16:16 pointer */
+ }
+ 
+ void CoTaskMemFree16(SEGPTR ptr)
+@@ -871,7 +871,7 @@ static SEGPTR taskmem_strdupWtoA(LPCWSTR str)
+     SEGPTR ret;
+     INT len;
+ 
+-    if (!str) return NULL;
++    if (!str) return 0;
+     len = WideCharToMultiByte(CP_ACP, 0, str, -1, NULL, 0, NULL, NULL);
+     ret = CoTaskMemAlloc16(len * sizeof(CHAR));
+     if (ret) WideCharToMultiByte(CP_ACP, 0, str, -1, MapSL(ret), len, NULL, NULL);
+@@ -1032,7 +1032,7 @@ HRESULT WINAPI OleLoadFromStream16(SEGPTR pStm, SEGPTR sriid, SEGPTR sppvObj)
+     if (FAILED(result))
+         return result;
+     pclsid = MapLS(&clsid);
+-    result = CoCreateInstance16(pclsid, NULL, CLSCTX_INPROC_SERVER, sriid, sppvObj);
++    result = CoCreateInstance16(pclsid, 0, CLSCTX_INPROC_SERVER, sriid, sppvObj);
+     UnMapLS(pclsid);
+     if (FAILED(result))
+         return result;
+@@ -1212,7 +1212,7 @@ HRESULT WINAPI GetClassFile16(LPCSTR lpszFileName, LPCLSID pclsid)
+     return hresult32_16(result);
+ }
+ 
+-HRESULT WINAPI OleCreateLinkToFile16(LPCSTR lpszFileName, REFIID riid, DWORD renderopt, LPFORMATETC16 pFormatetc, SEGPTR pClientSite, SEGPTR pStg, SEGPTR *ppvObj)
++HRESULT WINAPI OleCreateLinkToFile16(LPCSTR lpszFileName, REFIID riid, DWORD renderopt, FORMATETC16 *pFormatetc, SEGPTR pClientSite, SEGPTR pStg, SEGPTR *ppvObj)
+ {
+     HRESULT result;
+     LPCOLESTR lpwszFileName;
+diff --git a/storage/ifs.h b/storage/ifs.h
+index bda03e41..afc4e5d6 100644
+--- a/storage/ifs.h
++++ b/storage/ifs.h
+@@ -60,7 +60,11 @@ DECLARE_INTERFACE_(ILockBytes16,IUnknown)
+ 
+ typedef struct tagSTATSTG16
+ {
++#ifdef _WIN64
++    SEGPTR pwcsName; /* LPOLESTR16 */
++#else
+     LPOLESTR16 pwcsName;
++#endif
+     DWORD type;
+     ULARGE_INTEGER cbSize;
+     FILETIME mtime;
+diff --git a/storage/storage.c b/storage/storage.c
+index d7d477ec..c68327d8 100644
+--- a/storage/storage.c
++++ b/storage/storage.c
+@@ -1776,7 +1776,11 @@ HRESULT CDECL IStorage16_fnStat(IStorage16 *iface, STATSTG16 *pstatstg, DWORD gr
+ 		This,pstatstg,grfStatFlag
+ 	);
+         WideCharToMultiByte( CP_ACP, 0, This->stde.pps_rawname, -1, nameA, len, NULL, NULL );
++#ifdef _WIN64
++	pstatstg->pwcsName=MapLS( nameA );
++#else
+ 	pstatstg->pwcsName=(LPOLESTR16)MapLS( nameA );
++#endif
+ 	pstatstg->type = This->stde.pps_type;
+ 	pstatstg->cbSize.u.LowPart = This->stde.pps_size;
+ 	pstatstg->mtime = This->stde.pps_ft1; /* FIXME */ /* why? */

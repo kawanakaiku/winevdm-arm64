@@ -1,0 +1,173 @@
+From 0387afdf5e80daf28a3d181c93501cf6b5e2b332 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:08:13 +0900
+Subject: [PATCH 16/27] arm64: commctrl, ctl3dv2, dispdib, keyboard: fix
+ compile errors
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ commctrl/commctrl.c | 16 ++++++++--------
+ ctl3dv2/ctl3d.c     | 10 +++++-----
+ dispdib/dispdib.c   |  9 ++++++---
+ keyboard/keyboard.c |  2 +-
+ 4 files changed, 20 insertions(+), 17 deletions(-)
+
+diff --git a/commctrl/commctrl.c b/commctrl/commctrl.c
+index 29002c56..8c53932f 100644
+--- a/commctrl/commctrl.c
++++ b/commctrl/commctrl.c
+@@ -40,7 +40,7 @@ void WINAPI InitCommonControls16(void)
+     if (GetClassInfoExA(NULL, TOOLBARCLASSNAMEA, &toolbar_window_class))
+     {
+         WNDCLASSEXA cls16 = toolbar_window_class;
+-        cls16.hInstance = hInstance16 = LoadLibrary16("COMMCTRL");
++        cls16.hInstance = (HINSTANCE)(ULONG_PTR)(hInstance16 = LoadLibrary16("COMMCTRL"));
+         cls16.lpszClassName = TOOLBARCLASSNAME16;
+         cls16.lpfnWndProc = ToolbarWindowProc16;
+         if (!RegisterClassExA(&cls16))
+@@ -51,7 +51,7 @@ void WINAPI InitCommonControls16(void)
+     if (GetClassInfoExA(NULL, STATUSCLASSNAMEA, &status_window_class))
+     {
+         WNDCLASSEXA cls16 = status_window_class;
+-        cls16.hInstance = hInstance16;
++        cls16.hInstance = (HINSTANCE)(ULONG_PTR)hInstance16;
+         cls16.lpszClassName = STATUSCLASSNAME16;
+         cls16.lpfnWndProc = StatusWindowProc16;
+         if (!RegisterClassExA(&cls16))
+@@ -137,7 +137,7 @@ LRESULT WINAPI ToolbarWindowProc16(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
+     {
+     case TB_BUTTONSTRUCTSIZE:
+     {
+-        SetPropW(hwnd, L"TB_BUTTONSTRUCTSIZE", wParam);
++        SetPropW(hwnd, L"TB_BUTTONSTRUCTSIZE", (HANDLE)wParam);
+         wParam = sizeof(TBBUTTON);
+         break;
+     }
+@@ -149,13 +149,13 @@ LRESULT WINAPI ToolbarWindowProc16(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
+         TBADDBITMAP tb32 = { 0 };
+         if (!hInst16)
+         {
+-            tb32.nID = HBITMAP_32(nID16);
++            tb32.nID = (UINT_PTR)HBITMAP_32(nID16);
+         }
+         else
+         {
+-            tb32.nID = HBITMAP_32(LoadBitmap16(hInst16, (LPCSTR)nID16));
++            tb32.nID = (UINT_PTR)HBITMAP_32(LoadBitmap16(hInst16, MAKEINTRESOURCEA(nID16)));
+         }
+-        lParam = &tb32;
++        lParam = (LPARAM)&tb32;
+         return CallWindowProcA(toolbar_window_class.lpfnWndProc, hwnd, msg, wParam, lParam);
+     }
+     case TB_ADDBUTTONSA:
+@@ -165,7 +165,7 @@ LRESULT WINAPI ToolbarWindowProc16(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
+         SIZE_T button_struct_size;
+         if (!HIWORD(btn))
+             break;
+-        button_struct_size = GetPropW(hwnd, L"TB_BUTTONSTRUCTSIZE");
++        button_struct_size = (SIZE_T)GetPropW(hwnd, L"TB_BUTTONSTRUCTSIZE");
+         btn32 = HeapAlloc(GetProcessHeap(), 0, sizeof(TBBUTTON) * wParam);
+         for (int i = 0; i < wParam; i++)
+         {
+@@ -233,7 +233,7 @@ HWND16 WINAPI CreateToolbarEx16(HWND16 hwnd, DWORD style /* window style */, UIN
+ 
+     hwndTB =
+         CreateWindowExA(0, TOOLBARCLASSNAME16, NULL, style|WS_CHILD, 0,0,100,30,
+-                        HWND_32(hwnd), (HMENU)(DWORD_PTR)wID, hInstance16, NULL);
++                        HWND_32(hwnd), (HMENU)(DWORD_PTR)wID, (HINSTANCE)(ULONG_PTR)hInstance16, NULL);
+     if(hwndTB) {
+ 
+         SendMessageA (hwndTB, TB_BUTTONSTRUCTSIZE, uStructSize, 0);
+diff --git a/ctl3dv2/ctl3d.c b/ctl3dv2/ctl3d.c
+index 5e785e4d..e6448ee2 100644
+--- a/ctl3dv2/ctl3d.c
++++ b/ctl3dv2/ctl3d.c
+@@ -55,7 +55,7 @@ struct autosubclass
+     DWORD type;
+ };
+ 
+-static DWORD autosubclass_index = NULL;
++static DWORD autosubclass_index = 0;
+ 
+ static WNDPROC listbox_proc;
+ static WNDPROC button_proc;
+@@ -160,12 +160,12 @@ static LRESULT CALLBACK subclassproc(INT code, WPARAM wp, LPARAM lp)
+     {
+         CBT_CREATEWNDA *cbt_cw = (CBT_CREATEWNDA *)lp;
+         char *cls = cbt_cw->lpcs->lpszClass;
+-        if ((DWORD)cls & 0xffff0000)
++        if (!IS_INTRESOURCE(cls))
+         {
+             if ((asc->type & CTL3D_EDITS) && (!strcmpi(cls, "EDIT")) || ((asc->type & CTL3D_LISTBOXES) && !strcmpi(cls, "LISTBOX")))
+             {
+                 DWORD exstyle = cbt_cw->lpcs->dwExStyle | WS_EX_CLIENTEDGE;
+-                SetWindowLongA(wp, GWL_EXSTYLE, exstyle);
++                SetWindowLongA((HWND)wp, GWL_EXSTYLE, exstyle);
+             }
+             if (!strcmpi(cls, "STATIC"))
+             {
+@@ -174,8 +174,8 @@ static LRESULT CALLBACK subclassproc(INT code, WPARAM wp, LPARAM lp)
+                 ctl3d_static(asc->type, &style, &exstyle);
+                 cbt_cw->lpcs->style = style;
+                 cbt_cw->lpcs->dwExStyle = exstyle;
+-                SetWindowLongA(wp, GWL_STYLE, style);
+-                SetWindowLongA(wp, GWL_EXSTYLE, exstyle);
++                SetWindowLongA((HWND)wp, GWL_STYLE, style);
++                SetWindowLongA((HWND)wp, GWL_EXSTYLE, exstyle);
+             }
+         }
+     }
+diff --git a/dispdib/dispdib.c b/dispdib/dispdib.c
+index 5188c606..85a76912 100644
+--- a/dispdib/dispdib.c
++++ b/dispdib/dispdib.c
+@@ -30,6 +30,9 @@
+ #include "wine/debug.h"
+ #include "../krnl386/dosexe.h"
+ 
++/* krnl386 (interrupts.c) */
++INTPROC DOSVM_SetBuiltinVector(BYTE intnum, INTPROC handler);
++
+ WINE_DEFAULT_DEBUG_CHANNEL(ddraw);
+ 
+ #define width 320
+@@ -85,7 +88,7 @@ static void draw()
+ static LRESULT CALLBACK ddwndproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+ {
+     static BOOL focus = FALSE, showcur = TRUE;
+-    HWND parhwnd = (HWND)GetWindowLongA(hwnd, GWL_HWNDPARENT);
++    HWND parhwnd = (HWND)GetWindowLongPtrA(hwnd, GWLP_HWNDPARENT);
+     switch (uMsg)
+     {
+         case WM_KILLFOCUS:
+@@ -107,7 +110,7 @@ static LRESULT CALLBACK ddwndproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
+         case WM_UNICHAR:
+         case WM_TIMER:
+         case WM_CLOSE:
+-            return CallWindowProcA((WNDPROC)GetWindowLongA(parhwnd, GWL_WNDPROC), parhwnd, uMsg, wParam, lParam);
++            return CallWindowProcA((WNDPROC)GetWindowLongPtrA(parhwnd, GWLP_WNDPROC), parhwnd, uMsg, wParam, lParam);
+         case WM_SETCURSOR:
+             if ((LOWORD(lParam) == HTCLIENT) && focus && showcur)
+             {
+@@ -122,7 +125,7 @@ static LRESULT CALLBACK ddwndproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
+             break;
+     }
+     if ((uMsg >= WM_MOUSEMOVE && uMsg <= WM_MBUTTONDOWN) || uMsg >= MM_JOY1MOVE)
+-        return CallWindowProcA((WNDPROC)GetWindowLongA(parhwnd, GWL_WNDPROC), parhwnd, uMsg, wParam, lParam);
++        return CallWindowProcA((WNDPROC)GetWindowLongPtrA(parhwnd, GWLP_WNDPROC), parhwnd, uMsg, wParam, lParam);
+     return DefWindowProcA(hwnd, uMsg, wParam, lParam);
+ }
+ 
+diff --git a/keyboard/keyboard.c b/keyboard/keyboard.c
+index f42ee4bb..100c5daa 100644
+--- a/keyboard/keyboard.c
++++ b/keyboard/keyboard.c
+@@ -81,7 +81,7 @@ VOID WINAPI Enable16( FARPROC16 proc, LPBYTE lpKeyState )
+  */
+ VOID WINAPI Disable16(VOID)
+ {
+-    DefKeybEventProc = NULL;
++    DefKeybEventProc = 0;
+     pKeyStateTable = NULL;
+ }
+ 

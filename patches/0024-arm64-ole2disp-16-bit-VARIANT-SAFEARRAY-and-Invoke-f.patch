@@ -1,0 +1,791 @@
+From dfc5bcc7824a4b65c766b08ae98a69947b1fdb2e Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:11:58 +0900
+Subject: [PATCH 24/27] arm64: ole2disp: 16-bit VARIANT, SAFEARRAY and Invoke
+ fixes
+
+- Float arguments of VarUI1FromR4/VarBstrFromR4 arrive as 'long' in
+  the 16-bit spec; add _conv entry points that reinterpret the bits
+  (an ARM64 float would be expected in s0).
+- SAFEARRAY16 element sizes are 16-bit sizes (SEGPTR, VARIANT16).
+- Pass flat pointers where flat pointers are expected (VarXxxFromStr16,
+  BstrFromVector16, SafeArrayCopy16, VectorFromBstr16 memcpy).
+- DispCallFunc16: read the 16-bit vtable as SEGPTRs, pass the result
+  pointer as a 16:16 pointer, use the WOWCallback16Ex based
+  call_method on ARM64 too.
+- ITypeInfo_fnInvoke16: keep the argument pointer array 32-bit side
+  sized, map BYREF arguments with MapLS, use the 16-bit VARIANT
+  helpers on VARIANT16.
+- Convert FUNCDESC oVft between native and 16:16 vtable units.
+- RegisterTypeLib: match the SDK prototype, fix the help directory
+  (was a SEGPTR used as a pointer and strrchr(NULL)).
+- CRITICAL_SECTION_DEBUG names do not fit the DWORD field on _WIN64.
+- Include oleauto.h before wine/debug.h for wine_dbgstr_vt().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ole2/ifs_thunk.c             |  6 ++-
+ ole2disp/ole2disp.c          | 34 +++++++-------
+ ole2disp/ole2disp.dll16.spec |  4 +-
+ ole2disp/ole2disp.h          |  3 +-
+ ole2disp/var/variant.c       | 54 +++++++++++-----------
+ ole2disp/var/vartype.c       | 22 +++++++--
+ ole2disp/wine_typelib.c      | 87 +++++++++++++++++++++++-------------
+ 7 files changed, 128 insertions(+), 82 deletions(-)
+
+diff --git a/ole2/ifs_thunk.c b/ole2/ifs_thunk.c
+index 529de0a5..a00c2bb4 100644
+--- a/ole2/ifs_thunk.c
++++ b/ole2/ifs_thunk.c
+@@ -1106,7 +1106,8 @@ FUNCDESC *map_funcdesc32(const FUNCDESC16 *a16)
+     a32->callconv = a16->callconv;
+     a32->cParams = a16->cParams;
+     a32->cParamsOpt = a16->cParamsOpt;
+-    a32->oVft = a16->oVft;
++    /* oVft counts 16:16 vtable entries on the 16-bit side, native pointers here */
++    a32->oVft = a16->oVft / sizeof(SEGPTR) * sizeof(void *);
+     a32->cScodes = a16->cScodes;
+     map_elemdesc16_32(&a32->elemdescFunc, &a16->elemdescFunc);
+     a32->wFuncFlags = a16->wFuncFlags;
+@@ -1138,7 +1139,8 @@ FUNCDESC16 *map_funcdesc16(const FUNCDESC *a32)
+     a16->callconv = a32->callconv;
+     a16->cParams = a32->cParams;
+     a16->cParamsOpt = a32->cParamsOpt;
+-    a16->oVft = a32->oVft;
++    /* oVft counts native pointers here, 16:16 vtable entries on the 16-bit side */
++    a16->oVft = a32->oVft / sizeof(void *) * sizeof(SEGPTR);
+     a16->cScodes = a32->cScodes;
+     map_elemdesc32_16(&a16->elemdescFunc, &a32->elemdescFunc);
+     a16->wFuncFlags = a32->wFuncFlags;
+diff --git a/ole2disp/ole2disp.c b/ole2disp/ole2disp.c
+index ad17f5c8..6d99fda4 100644
+--- a/ole2disp/ole2disp.c
++++ b/ole2disp/ole2disp.c
+@@ -441,7 +441,7 @@ HRESULT WINAPI SafeArrayGetElement16(SEGPTR segsa, LONG *rgIndices, void *pvData
+             hRet = E_OUTOFMEMORY;
+         }
+         else
+-          *lpDest = NULL;
++          *lpDest = 0;
+       }
+       else if (psa->fFeatures & (FADF_UNKNOWN|FADF_DISPATCH))
+       {
+@@ -461,7 +461,7 @@ HRESULT WINAPI SafeArrayGetElement16(SEGPTR segsa, LONG *rgIndices, void *pvData
+   return hRet;
+ }
+ 
+-HRESULT WINAPI SafeArrayCopy16(SAFEARRAY16 *sa, SAFEARRAY16 **ppsaout)
++HRESULT WINAPI SafeArrayCopy16(SAFEARRAY16 *sa, SEGPTR /* SAFEARRAY16 * */ *ppsaout)
+ {
+     FIXME("(%p,%p) stub!\n", sa, ppsaout);
+     return E_INVALIDARG;
+@@ -503,14 +503,15 @@ static DWORD SAFEARRAY_GetVTSize(VARTYPE vt)
+     case VT_UI8:      return sizeof(LONG64);
+     case VT_INT:
+     case VT_UINT:     return sizeof(INT);
++    /* element sizes in 16-bit memory */
+     case VT_INT_PTR:
+-    case VT_UINT_PTR: return sizeof(UINT_PTR);
++    case VT_UINT_PTR: return sizeof(DWORD);
+     case VT_CY:       return sizeof(CY);
+     case VT_DATE:     return sizeof(DATE);
+-    case VT_BSTR:     return sizeof(BSTR);
+-    case VT_DISPATCH: return sizeof(LPDISPATCH);
+-    case VT_VARIANT:  return sizeof(VARIANT);
+-    case VT_UNKNOWN:  return sizeof(LPUNKNOWN);
++    case VT_BSTR:     return sizeof(SEGPTR);   /* BSTR16 */
++    case VT_DISPATCH: return sizeof(SEGPTR);   /* IDispatch16 * */
++    case VT_VARIANT:  return sizeof(VARIANT16);
++    case VT_UNKNOWN:  return sizeof(SEGPTR);   /* IUnknown16 * */
+     case VT_DECIMAL:  return sizeof(DECIMAL);
+     /* Note: Return a non-zero size to indicate vt is valid. The actual size
+      * of a UDT is taken from the result of IRecordInfo_GetSize().
+@@ -560,11 +561,11 @@ HRESULT WINAPI SafeArrayAllocDescriptorEx16(VARTYPE vt, UINT cDims, SEGPTR *ppsa
+ /* Create an array */
+ static SEGPTR SAFEARRAY_Create(VARTYPE vt, UINT cDims, const SAFEARRAYBOUND16 *rgsabound, ULONG ulSize)
+ {
+-    SEGPTR psa = NULL;
++    SEGPTR psa = 0;
+   unsigned int i;
+ 
+   if (!rgsabound)
+-    return NULL;
++    return 0;
+ 
+   if (SUCCEEDED(SafeArrayAllocDescriptorEx16(vt, cDims, &psa)))
+   {
+@@ -585,7 +586,7 @@ static SEGPTR SAFEARRAY_Create(VARTYPE vt, UINT cDims, const SAFEARRAYBOUND16 *r
+     if (!((SAFEARRAY16*)MapSL(psa))->cbElements || FAILED(SafeArrayAllocData16(((SAFEARRAY16*)MapSL(psa)))))
+     {
+       SafeArrayDestroyDescriptor16(psa);
+-      psa = NULL;
++      psa = 0;
+     }
+   }
+   return psa;
+@@ -650,7 +651,7 @@ HRESULT WINAPI SafeArrayRedim16(SAFEARRAY16 *psa, SAFEARRAYBOUND16 *psabound)
+     {
+       /* Lengthen the final dimension */
+       ULONG ulOldSize, ulNewSize;
+-      PVOID pvNewData;
++      SEGPTR pvNewData;
+ 
+       ulOldSize = safearray_getcellcount(psa);
+       if (ulOldSize)
+@@ -708,7 +709,7 @@ HRESULT WINAPI VectorFromBstr16(SEGBSTR16 bstr, /* SAFEARRAY16 * */SEGPTR *ppsa)
+ 
+   if (*ppsa)
+   {
+-    memcpy(((SAFEARRAY16*)MapSL(*ppsa))->pvData, bstr, sab.cElements);
++    memcpy(MapSL(((SAFEARRAY16*)MapSL(*ppsa))->pvData), MapSL(bstr), sab.cElements);
+     return S_OK;
+   }
+   return E_OUTOFMEMORY;
+@@ -751,7 +752,7 @@ static SEGPTR BSTR_AllocBytes(int n)
+     BYTE_BLOB16 *ptr;
+     if (FAILED(get_task_imalloc16(&mal)))
+         return 0;
+-    p = IMalloc16_Alloc(mal, n + sizeof(BYTE_BLOB16) - sizeof(OLECHAR16));
++    p = (SEGPTR)(ULONG_PTR)IMalloc16_Alloc(mal, n + sizeof(BYTE_BLOB16) - sizeof(OLECHAR16)); /* a 16:16 pointer */
+     ptr = (BYTE_BLOB16*)MapSL(p);
+     ptr->clSize = n - 1;
+     return get_bstr16_from_blob16(p);
+@@ -788,12 +789,12 @@ HRESULT WINAPI BstrFromVector16(SAFEARRAY16 *psa, /*BSTR*/SEGPTR *pbstr)
+   if (!pbstr)
+     return E_INVALIDARG;
+ 
+-  *pbstr = NULL;
++  *pbstr = 0;
+ 
+   if (!psa || psa->cbElements != 1 || psa->cDims != 1)
+     return E_INVALIDARG;
+ 
+-  *pbstr = SysAllocStringByteLen16(psa->pvData, psa->rgsabound[0].cElements);
++  *pbstr = SysAllocStringByteLen16(MapSL(psa->pvData), psa->rgsabound[0].cElements);
+   if (!*pbstr)
+     return E_OUTOFMEMORY;
+   return S_OK;
+@@ -1102,7 +1103,8 @@ HRESULT WINAPI CreateStdDispatch16(
+     HRESULT result;
+     IUnknown *punkStdDisp = NULL;
+     TRACE("(%p,%p,%p,%p)\n",punkOuter, pvThis, ptinfo, ppunkStdDisp);
+-    result = CreateStdDispatch((IUnknown*)iface16_32(&IID_IUnknown, punkOuter), pvThis, (ITypeInfo*)iface16_32(&IID_ITypeInfo, ptinfo), &punkStdDisp);
++    /* pvThis stays a 16:16 pointer: the 16-bit ITypeInfo::Invoke gets it back */
++    result = CreateStdDispatch((IUnknown*)iface16_32(&IID_IUnknown, punkOuter), (void *)(ULONG_PTR)pvThis, (ITypeInfo*)iface16_32(&IID_ITypeInfo, ptinfo), &punkStdDisp);
+     *ppunkStdDisp = iface32_16(&IID_IUnknown, punkStdDisp);
+     return hresult32_16(result);
+ }
+diff --git a/ole2disp/ole2disp.dll16.spec b/ole2disp/ole2disp.dll16.spec
+index 87d914e3..970df70d 100644
+--- a/ole2disp/ole2disp.dll16.spec
++++ b/ole2disp/ole2disp.dll16.spec
+@@ -90,7 +90,7 @@
+ 90 stub VARCYFROMBOOL
+ 91 pascal VarBstrFromI2(s_word long long ptr) VarBstrFromI216
+ 92 pascal VarBstrFromI4(long long long ptr) VarBstrFromI416
+-93 pascal VarBstrFromR4(long long long ptr) VarBstrFromR416
++93 pascal VarBstrFromR4(long long long ptr) VarBstrFromR416_conv
+ 94 pascal VarBstrFromR8(long long long long ptr) VarBstrFromR816_conv
+ 95 pascal VarBstrFromCy(long long long long ptr) VarBstrFromCy16_conv
+ 96 pascal VarBstrFromDate(long long long long ptr) VarBstrFromDate16_conv
+@@ -115,7 +115,7 @@
+ 115 variable _IID_ISupportErrorInfo(0xdf0b3d60 0x101b548f 0x0008658e 0x19d12b2b)
+ 116 pascal VarUI1FromI2(word ptr) VarUI1FromI216
+ 117 pascal VarUI1FromI4(long ptr) VarUI1FromI416
+-118 pascal VarUI1FromR4(long ptr) VarUI1FromR416
++118 pascal VarUI1FromR4(long ptr) VarUI1FromR416_conv
+ 119 pascal VarUI1FromR8(long long ptr) VarUI1FromR816_conv
+ 120 pascal VarUI1FromCy(long long ptr) VarUI1FromCy16_conv
+ 121 pascal VarUI1FromDate(long long ptr) VarUI1FromDate16_conv
+diff --git a/ole2disp/ole2disp.h b/ole2disp/ole2disp.h
+index fa2f04fd..eb132d29 100644
+--- a/ole2disp/ole2disp.h
++++ b/ole2disp/ole2disp.h
+@@ -28,6 +28,7 @@
+ #include "wine/windef16.h"
+ #include "wine/winbase16.h"
+ #include "../ole2/ifs.h"
++#include "oleauto.h" /* before wine/debug.h, for wine_dbgstr_vt() */
+ #include "wine/debug.h"
+ 
+ typedef CHAR OLECHAR16;
+@@ -127,7 +128,7 @@ HRESULT WINAPI SafeArrayAllocDescriptor16(UINT16 dims, SEGPTR *ret);
+ HRESULT WINAPI SafeArrayAllocData16(SAFEARRAY16 *sa);
+ HRESULT WINAPI SafeArrayDestroyDescriptor16(SEGPTR s);
+ HRESULT WINAPI SafeArrayDestroyData16(SAFEARRAY16 *sa);
+-HRESULT WINAPI SafeArrayCopy16(SAFEARRAY16 *sa, SAFEARRAY16 **ppsaout);
++HRESULT WINAPI SafeArrayCopy16(SAFEARRAY16 *sa, SEGPTR /* SAFEARRAY16 * */ *ppsaout);
+ SEGPTR WINAPI SysAllocString16(LPCOLESTR16 oleStr);
+ INT16 WINAPI SysReAllocString16(SEGPTR *pbstr, LPCOLESTR16 oleStr);
+ SEGPTR WINAPI SysAllocStringLen16(SEGPTR oleStr, int len);
+diff --git a/ole2disp/var/variant.c b/ole2disp/var/variant.c
+index ba0ead4b..de664775 100644
+--- a/ole2disp/var/variant.c
++++ b/ole2disp/var/variant.c
+@@ -61,7 +61,11 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
+ {
+     0, 0, &cache_cs,
+     { &critsect_debug.ProcessLocksList, &critsect_debug.ProcessLocksList },
++#ifdef _WIN64
++      0, 0, { 0 } /* the name pointer does not fit the DWORD debug field */
++#else
+       0, 0, { (DWORD_PTR)(__FILE__ ": cache_cs") }
++#endif
+ };
+ static CRITICAL_SECTION cache_cs = { &critsect_debug, -1, 0, 0, 0, 0 };
+ 
+@@ -424,7 +428,7 @@ static inline HRESULT VARIANT_Coerce(VARIANTARG16* pd, LCID lcid, USHORT wFlags,
+     switch (vtFrom)
+     {
+     case VT_EMPTY:
+-      V_BSTR(pd) = SysAllocStringLen16(NULL, 0);
++      V_BSTR(pd) = SysAllocStringLen16(0, 0);
+       return V_BSTR(pd) ? S_OK : E_OUTOFMEMORY;
+     case VT_BOOL:
+       if (wFlags & (VARIANT_ALPHABOOL|VARIANT_LOCALBOOL))
+@@ -547,13 +551,13 @@ static inline HRESULT VARIANT_Coerce(VARIANTARG16* pd, LCID lcid, USHORT wFlags,
+ static inline HRESULT VARIANT_CoerceArray(VARIANTARG16* pd, VARIANTARG16* ps, VARTYPE vt)
+ {
+   if (vt == VT_BSTR && V_VT(ps) == (VT_ARRAY|VT_UI1))
+-    return BstrFromVector16(V_ARRAY(ps), &V_BSTR(pd));
++    return BstrFromVector16(MapSL(V_ARRAY(ps)), &V_BSTR(pd));
+ 
+   if (V_VT(ps) == VT_BSTR && vt == (VT_ARRAY|VT_UI1))
+     return VectorFromBstr16(V_BSTR(ps), &V_ARRAY(pd));
+ 
+   if (V_VT(ps) == vt)
+-    return SafeArrayCopy16(V_ARRAY(ps), &V_ARRAY(pd));
++    return SafeArrayCopy16(MapSL(V_ARRAY(ps)), &V_ARRAY(pd));
+ 
+   return DISP_E_TYPEMISMATCH;
+ }
+@@ -838,7 +842,7 @@ HRESULT WINAPI VariantCopy16(VARIANTARG16* pvargDest, VARIANTARG16* pvargSrc)
+         break;
+       default:
+         if (V_ISARRAY(pvargSrc))
+-          hres = SafeArrayCopy16(V_ARRAY(pvargSrc), &V_ARRAY(pvargDest));
++          hres = SafeArrayCopy16(MapSL(V_ARRAY(pvargSrc)), &V_ARRAY(pvargDest));
+       }
+     }
+   }
+@@ -946,7 +950,7 @@ HRESULT WINAPI VariantCopyInd16(VARIANT16* pvargDest, VARIANTARG16* pvargSrc)
+   if (V_ISARRAY(pSrc))
+   {
+     /* Native doesn't check that *V_ARRAYREF(pSrc) is valid */
+-    hres = SafeArrayCopy16(*V_ARRAYREF16(pSrc), &V_ARRAY(pvargDest));
++    hres = SafeArrayCopy16(MapSL(*V_ARRAYREF16(pSrc)), &V_ARRAY(pvargDest));
+   }
+   else if (V_VT(pSrc) == (VT_BSTR|VT_BYREF))
+   {
+@@ -2584,7 +2588,7 @@ VarNumFromParseNum_DecOverflow:
+  */
+ HRESULT WINAPI VarCat16(LPVARIANT16 left, LPVARIANT16 right, LPVARIANT16 out)
+ {
+-    SEGBSTR16 left_str = NULL, right_str = NULL;
++    SEGBSTR16 left_str = 0, right_str = 0;
+     VARTYPE leftvt, rightvt;
+     HRESULT hres;
+ 
+@@ -3088,7 +3092,7 @@ HRESULT WINAPI VarAnd16(LPVARIANT16 left, LPVARIANT16 right, LPVARIANT16 result)
+                 break;
+ #endif
+             case VT_BSTR:
+-                hres = VarBoolFromStr16(V_BSTR(right),
++                hres = VarBoolFromStr16(BSTR_PTR(V_BSTR(right)),
+                 LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &b);
+                 if (FAILED(hres))
+                     return hres;
+@@ -3119,7 +3123,7 @@ HRESULT WINAPI VarAnd16(LPVARIANT16 left, LPVARIANT16 right, LPVARIANT16 result)
+         double d;
+ 
+         if (V_VT(&varLeft) == VT_BSTR &&
+-            FAILED(VarR8FromStr16(V_BSTR(&varLeft),
++            FAILED(VarR8FromStr16(BSTR_PTR(V_BSTR(&varLeft)),
+             LOCALE_USER_DEFAULT, 0, &d)))
+             hres = VariantChangeType16(&varLeft,&varLeft,
+             VARIANT_LOCALBOOL, VT_BOOL);
+@@ -3135,7 +3139,7 @@ HRESULT WINAPI VarAnd16(LPVARIANT16 left, LPVARIANT16 right, LPVARIANT16 result)
+         double d;
+ 
+         if (V_VT(&varRight) == VT_BSTR &&
+-            FAILED(VarR8FromStr16(V_BSTR(&varRight),
++            FAILED(VarR8FromStr16(BSTR_PTR(V_BSTR(&varRight)),
+             LOCALE_USER_DEFAULT, 0, &d)))
+             hres = VariantChangeType16(&varRight, &varRight,
+                 VARIANT_LOCALBOOL, VT_BOOL);
+@@ -4143,7 +4147,7 @@ HRESULT WINAPI VarOr16(LPVARIANT16 pVarLeft, LPVARIANT16 pVarRight, LPVARIANT16
+                 goto VarOr_Exit;
+             }
+ 
+-            hRet = VarBoolFromStr16(V_BSTR(pVarLeft), LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &b);
++            hRet = VarBoolFromStr16(BSTR_PTR(V_BSTR(pVarLeft)), LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &b);
+             if (SUCCEEDED(hRet) && b)
+             {
+                 V_VT(pVarOut) = VT_BOOL;
+@@ -4275,7 +4279,7 @@ VarOr_AsEmpty:
+         double d;
+ 
+         if (V_VT(&varLeft) == VT_BSTR &&
+-            FAILED(VarR8FromStr16(V_BSTR(&varLeft), LOCALE_USER_DEFAULT, 0, &d)))
++            FAILED(VarR8FromStr16(BSTR_PTR(V_BSTR(&varLeft)), LOCALE_USER_DEFAULT, 0, &d)))
+             hRet = VariantChangeType16(&varLeft, &varLeft, VARIANT_LOCALBOOL, VT_BOOL);
+         if (SUCCEEDED(hRet) && V_VT(&varLeft) != vt)
+             hRet = VariantChangeType16(&varLeft, &varLeft, 0, vt);
+@@ -4290,7 +4294,7 @@ VarOr_AsEmpty:
+         double d;
+ 
+         if (V_VT(&varRight) == VT_BSTR &&
+-            FAILED(VarR8FromStr16(V_BSTR(&varRight), LOCALE_USER_DEFAULT, 0, &d)))
++            FAILED(VarR8FromStr16(BSTR_PTR(V_BSTR(&varRight)), LOCALE_USER_DEFAULT, 0, &d)))
+             hRet = VariantChangeType16(&varRight, &varRight, VARIANT_LOCALBOOL, VT_BOOL);
+         if (SUCCEEDED(hRet) && V_VT(&varRight) != vt)
+             hRet = VariantChangeType16(&varRight, &varRight, 0, vt);
+@@ -4390,7 +4394,7 @@ HRESULT WINAPI VarAbs16(LPVARIANT16 pVarIn, LPVARIANT16 pVarOut)
+     ABS_CASE(I8,I8_MIN);
+     ABS_CASE(R4,R4_MIN);
+     case VT_BSTR:
+-        hRet = VarR8FromStr16(V_BSTR(pVarIn), LOCALE_USER_DEFAULT, 0, &V_R8(&varIn));
++        hRet = VarR8FromStr16(BSTR_PTR(V_BSTR(pVarIn)), LOCALE_USER_DEFAULT, 0, &V_R8(&varIn));
+         if (FAILED(hRet))
+             break;
+         V_VT(pVarOut) = VT_R8;
+@@ -4495,7 +4499,7 @@ HRESULT WINAPI VarFix16(LPVARIANT16 pVarIn, LPVARIANT16 pVarOut)
+         break;
+     case VT_BSTR:
+         V_VT(pVarOut) = VT_R8;
+-        hRet = VarR8FromStr16(V_BSTR(pVarIn), LOCALE_USER_DEFAULT, 0, &V_R8(pVarOut));
++        hRet = VarR8FromStr16(BSTR_PTR(V_BSTR(pVarIn)), LOCALE_USER_DEFAULT, 0, &V_R8(pVarOut));
+         pVarIn = pVarOut;
+         /* Fall through */
+     case VT_DATE:
+@@ -4585,7 +4589,7 @@ HRESULT WINAPI VarInt16(LPVARIANT16 pVarIn, LPVARIANT16 pVarOut)
+         break;
+     case VT_BSTR:
+         V_VT(pVarOut) = VT_R8;
+-        hRet = VarR8FromStr16(V_BSTR(pVarIn), LOCALE_USER_DEFAULT, 0, &V_R8(pVarOut));
++        hRet = VarR8FromStr16(BSTR_PTR(V_BSTR(pVarIn)), LOCALE_USER_DEFAULT, 0, &V_R8(pVarOut));
+         pVarIn = pVarOut;
+         /* Fall through */
+     case VT_DATE:
+@@ -4691,7 +4695,7 @@ HRESULT WINAPI VarXor16(LPVARIANT16 pVarLeft, LPVARIANT16 pVarRight, LPVARIANT16
+     /* Try any strings first as numbers, then as VT_BOOL */
+     if (V_VT(&varLeft) == VT_BSTR)
+     {
+-        hRet = VarR8FromStr16(V_BSTR(&varLeft), LOCALE_USER_DEFAULT, 0, &d);
++        hRet = VarR8FromStr16(BSTR_PTR(V_BSTR(&varLeft)), LOCALE_USER_DEFAULT, 0, &d);
+         hRet = VariantChangeType16(&varLeft, &varLeft, VARIANT_LOCALBOOL,
+                                  FAILED(hRet) ? VT_BOOL : VT_I4);
+         if (FAILED(hRet))
+@@ -4700,7 +4704,7 @@ HRESULT WINAPI VarXor16(LPVARIANT16 pVarLeft, LPVARIANT16 pVarRight, LPVARIANT16
+ 
+     if (V_VT(&varRight) == VT_BSTR)
+     {
+-        hRet = VarR8FromStr16(V_BSTR(&varRight), LOCALE_USER_DEFAULT, 0, &d);
++        hRet = VarR8FromStr16(BSTR_PTR(V_BSTR(&varRight)), LOCALE_USER_DEFAULT, 0, &d);
+         hRet = VariantChangeType16(&varRight, &varRight, VARIANT_LOCALBOOL,
+                                  FAILED(hRet) ? VT_BOOL : VT_I4);
+         if (FAILED(hRet))
+@@ -4942,7 +4946,7 @@ HRESULT WINAPI VarNeg16(LPVARIANT16 pVarIn, LPVARIANT16 pVarOut)
+ #endif
+     case VT_BSTR:
+         V_VT(pVarOut) = VT_R8;
+-        hRet = VarR8FromStr16(V_BSTR(pVarIn), LOCALE_USER_DEFAULT, 0, &V_R8(pVarOut));
++        hRet = VarR8FromStr16(BSTR_PTR(V_BSTR(pVarIn)), LOCALE_USER_DEFAULT, 0, &V_R8(pVarOut));
+         V_R8(pVarOut) = -V_R8(pVarOut);
+         break;
+     case VT_EMPTY:
+@@ -5021,11 +5025,11 @@ HRESULT WINAPI VarNot16(LPVARIANT16 pVarIn, LPVARIANT16 pVarOut)
+     if (V_VT(pVarIn) == VT_BSTR)
+     {
+         V_VT(&varIn) = VT_R8;
+-        hRet = VarR8FromStr16( V_BSTR(pVarIn), LOCALE_USER_DEFAULT, 0, &V_R8(&varIn) );
++        hRet = VarR8FromStr16( BSTR_PTR(V_BSTR(pVarIn)), LOCALE_USER_DEFAULT, 0, &V_R8(&varIn) );
+         if (FAILED(hRet))
+         {
+             V_VT(&varIn) = VT_BOOL;
+-            hRet = VarBoolFromStr16( V_BSTR(pVarIn), LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &V_BOOL(&varIn) );
++            hRet = VarBoolFromStr16( BSTR_PTR(V_BSTR(pVarIn)), LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &V_BOOL(&varIn) );
+         }
+         if (FAILED(hRet)) goto VarNot_Exit;
+         pVarIn = &varIn;
+@@ -5182,7 +5186,7 @@ HRESULT WINAPI VarRound16(LPVARIANT16 pVarIn, int deci, LPVARIANT16 pVarOut)
+ 	V_I2(pVarOut) = V_BOOL(pVarIn);
+ 	break;
+     case VT_BSTR:
+-	hRet = VarR8FromStr16(V_BSTR(pVarIn), LOCALE_USER_DEFAULT, 0, &V_R8(&varIn));
++	hRet = VarR8FromStr16(BSTR_PTR(V_BSTR(pVarIn)), LOCALE_USER_DEFAULT, 0, &V_R8(&varIn));
+ 	if (FAILED(hRet))
+ 	    break;
+ 	V_VT(&varIn)=VT_R8;
+@@ -5889,7 +5893,7 @@ HRESULT WINAPI VarImp16(LPVARIANT16 left, LPVARIANT16 right, LPVARIANT16 result)
+             break;
+ #endif
+         case VT_BSTR:
+-            hres = VarBoolFromStr16(V_BSTR(right),LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &b);
++            hres = VarBoolFromStr16(BSTR_PTR(V_BSTR(right)),LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &b);
+             if (FAILED(hres)) goto VarImp_Exit;
+             else if (!b)
+                 V_VT(result) = VT_NULL;
+@@ -5941,7 +5945,7 @@ HRESULT WINAPI VarImp16(LPVARIANT16 left, LPVARIANT16 right, LPVARIANT16 result)
+             break;
+ #endif
+         case VT_BSTR:
+-            hres = VarBoolFromStr16(V_BSTR(left),LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &b);
++            hres = VarBoolFromStr16(BSTR_PTR(V_BSTR(left)),LOCALE_USER_DEFAULT, VAR_LOCALBOOL, &b);
+             if (FAILED(hres)) goto VarImp_Exit;
+             else if (b == VARIANT_TRUE)
+                 resvt = VT_NULL;
+@@ -5968,14 +5972,14 @@ HRESULT WINAPI VarImp16(LPVARIANT16 left, LPVARIANT16 right, LPVARIANT16 result)
+     }
+ 
+     if (V_VT(&lv) == VT_BSTR &&
+-        FAILED(VarR8FromStr16(V_BSTR(&lv),LOCALE_USER_DEFAULT, 0, &d)))
++        FAILED(VarR8FromStr16(BSTR_PTR(V_BSTR(&lv)),LOCALE_USER_DEFAULT, 0, &d)))
+         hres = VariantChangeType16(&lv,&lv,VARIANT_LOCALBOOL, VT_BOOL);
+     if (SUCCEEDED(hres) && V_VT(&lv) != resvt)
+         hres = VariantChangeType16(&lv,&lv,0,resvt);
+     if (FAILED(hres)) goto VarImp_Exit;
+ 
+     if (V_VT(&rv) == VT_BSTR &&
+-        FAILED(VarR8FromStr16(V_BSTR(&rv),LOCALE_USER_DEFAULT, 0, &d)))
++        FAILED(VarR8FromStr16(BSTR_PTR(V_BSTR(&rv)),LOCALE_USER_DEFAULT, 0, &d)))
+         hres = VariantChangeType16(&rv, &rv,VARIANT_LOCALBOOL, VT_BOOL);
+     if (SUCCEEDED(hres) && V_VT(&rv) != resvt)
+         hres = VariantChangeType16(&rv, &rv, 0, resvt);
+diff --git a/ole2disp/var/vartype.c b/ole2disp/var/vartype.c
+index b4c08d5d..246e39c2 100644
+--- a/ole2disp/var/vartype.c
++++ b/ole2disp/var/vartype.c
+@@ -22,6 +22,8 @@
+ #define NONAMELESSUNION
+ #define NONAMELESSSTRUCT
+ 
++#include "windef.h"
++#include "oleauto.h" /* before wine/debug.h, for wine_dbgstr_vt() */
+ #include "wine/debug.h"
+ #include "wine/unicode.h"
+ #include "winbase.h"
+@@ -138,7 +140,7 @@ static HRESULT VARIANT_NumberFromBstr(OLECHAR16* pStrIn, LCID lcid, ULONG ulFlag
+ static HRESULT VARIANT_FromDisp(SEGIDispatch pdispIn, LCID lcid, void* pOut,
+                                 VARTYPE vt, DWORD dwFlags)
+ {
+-  static DISPPARAMS16 emptyParams = { NULL, NULL, 0, 0 };
++  static DISPPARAMS16 emptyParams = { 0, 0, 0, 0 };
+   VARIANTARG16 srcVar, dstVar;
+   HRESULT hRet;
+ 
+@@ -148,7 +150,7 @@ static HRESULT VARIANT_FromDisp(SEGIDispatch pdispIn, LCID lcid, void* pOut,
+   /* Get the default 'value' property from the IDispatch */
+   VariantInit16(&srcVar);
+   hRet = IDispatch16_Invoke(pdispIn, DISPID_VALUE, MapLS(&IID_NULL), lcid, DISPATCH_PROPERTYGET,
+-                          MapLS(&emptyParams), MapLS(&srcVar), NULL, NULL);
++                          MapLS(&emptyParams), MapLS(&srcVar), 0, 0);
+ 
+   if (SUCCEEDED(hRet))
+   {
+@@ -655,6 +657,12 @@ HRESULT WINAPI VarUI1FromI416(LONG iIn, BYTE* pbOut)
+  *           DISP_E_OVERFLOW, if the value will not fit in the destination
+  *           DISP_E_TYPEMISMATCH, if the type cannot be converted
+  */
++/* 16-bit entry point: the float arrives as a 32-bit integer argument */
++HRESULT WINAPI VarUI1FromR416_conv(DWORD fltIn, BYTE* pbOut)
++{
++  return VarUI1FromR416(*(FLOAT *)&fltIn, pbOut);
++}
++
+ HRESULT WINAPI VarUI1FromR416(FLOAT fltIn, BYTE* pbOut)
+ {
+   return VarUI1FromR8(fltIn, pbOut);
+@@ -6657,6 +6665,12 @@ static HRESULT VARIANT_BstrFromReal(DOUBLE dblIn, LCID lcid, ULONG dwFlags,
+  *  Failure: E_INVALIDARG, if pbstrOut is invalid.
+  *           E_OUTOFMEMORY, if memory allocation fails.
+  */
++/* 16-bit entry point: the float arrives as a 32-bit integer argument */
++HRESULT WINAPI VarBstrFromR416_conv(DWORD fltIn, LCID lcid, ULONG dwFlags, SEGBSTR16* pbstrOut)
++{
++  return VarBstrFromR416(*(FLOAT *)&fltIn, lcid, dwFlags, pbstrOut);
++}
++
+ HRESULT WINAPI VarBstrFromR416(FLOAT fltIn, LCID lcid, ULONG dwFlags, SEGBSTR16* pbstrOut)
+ {
+   return VARIANT_BstrFromReal(fltIn, lcid, dwFlags, pbstrOut, szFloatFormatW);
+@@ -7243,7 +7257,7 @@ HRESULT WINAPI VarBstrCat16(SEGBSTR16 pbstrLeft, SEGBSTR16 pbstrRight, SEGBSTR16
+ 
+   TRACE("%s,%s,%p\n",
+    debugstr_an(BSTR_PTR(pbstrLeft), SysStringLen16(pbstrLeft)),
+-   debugstr_an(BSTR_PTR(pbstrRight), SysStringLen16(pbstrRight)), BSTR_PTR(pbstrOut));
++   debugstr_an(BSTR_PTR(pbstrRight), SysStringLen16(pbstrRight)), pbstrOut);
+ 
+   if (!pbstrOut)
+     return E_INVALIDARG;
+@@ -7262,7 +7276,7 @@ HRESULT WINAPI VarBstrCat16(SEGBSTR16 pbstrLeft, SEGBSTR16 pbstrRight, SEGBSTR16
+     memcpy(BSTR_PTR(*pbstrOut), BSTR_PTR(pbstrLeft), lenLeft);
+ 
+   if (pbstrRight)
+-    memcpy(BSTR_PTR((CHAR*)*pbstrOut + lenLeft), BSTR_PTR(pbstrRight), lenRight);
++    memcpy(BSTR_PTR(*pbstrOut) + lenLeft, BSTR_PTR(pbstrRight), lenRight);
+ 
+   TRACE("%s\n", debugstr_an(BSTR_PTR(*pbstrOut), SysStringLen16(*pbstrOut)));
+   return S_OK;
+diff --git a/ole2disp/wine_typelib.c b/ole2disp/wine_typelib.c
+index 32080e41..3846b10a 100644
+--- a/ole2disp/wine_typelib.c
++++ b/ole2disp/wine_typelib.c
+@@ -662,8 +662,8 @@ static void TLB_register_interface(TLIBATTR *libattr, LPOLESTR name, TYPEATTR *t
+  */
+ HRESULT WINAPI RegisterTypeLib(
+      ITypeLib * ptlib,     /* [in] Pointer to the library*/
+-     OLECHAR * szFullPath, /* [in] full Path of the library*/
+-     OLECHAR * szHelpDir)  /* [in] dir to the helpfile for the library,
++     LPCOLESTR szFullPath, /* [in] full Path of the library*/
++     LPCOLESTR szHelpDir)  /* [in] dir to the helpfile for the library,
+ 							 may be NULL*/
+ {
+     HRESULT res;
+@@ -749,7 +749,6 @@ HRESULT WINAPI RegisterTypeLib(
+ 
+         if (res == S_OK && RegCreateKey16(key, HELPDIR, &subKey) == ERROR_SUCCESS)
+         {
+-            BOOL freeHelpDir = FALSE;
+             OLECHAR16* pIndexStr;
+             OLECHAR16* helpstra = NULL;
+ 
+@@ -757,23 +756,25 @@ HRESULT WINAPI RegisterTypeLib(
+                to the directory which contains the typelib. However,
+                if we just opened an existing key, we leave the helpdir alone */
+             if ((disposition == REG_CREATED_NEW_KEY) && (szHelpDir == NULL)) {
+-                helpstra = SysAllocString16(fullpatha);
+-                pIndexStr = strrchr(szHelpDir, '\\');
+-                if (pIndexStr) {
+-                    *pIndexStr = 0;
++                /* was SysAllocString16() (a SEGPTR) and strrchr(szHelpDir) (NULL) */
++                helpstra = HeapAlloc(GetProcessHeap(), 0, lstrlenA(fullpatha) + 1);
++                if (helpstra) {
++                    lstrcpyA(helpstra, fullpatha);
++                    pIndexStr = strrchr(helpstra, '\\');
++                    if (pIndexStr) {
++                        *pIndexStr = 0;
++                    }
+                 }
+-                freeHelpDir = TRUE;
+             }
+             else if (szHelpDir != NULL)
+-                helpstra = strdupWtoA(szHelpDir);
++                helpstra = (OLECHAR16 *)strdupWtoA(szHelpDir);
+ 
+ 
+             /* if we have an szHelpDir, set it! */
+             if (helpstra != NULL) {
+-                if (RegSetValueEx16(subKey, NULL, 0, REG_SZ, helpstra, (lstrlenA(szHelpDir)+1)) != ERROR_SUCCESS)
++                if (RegSetValueEx16(subKey, NULL, 0, REG_SZ, helpstra, (lstrlenA(helpstra)+1)) != ERROR_SUCCESS)
+                     res = E_FAIL;
+-                if (freeHelpDir) SysFreeString16(helpstra);
+-                else HeapFree(GetProcessHeap(), 0, helpstra);
++                HeapFree(GetProcessHeap(), 0, helpstra);
+             }
+ 
+             /* tidy up */
+@@ -2922,7 +2923,11 @@ static CRITICAL_SECTION_DEBUG cache_section_debug =
+ {
+     0, 0, &cache_section,
+     { &cache_section_debug.ProcessLocksList, &cache_section_debug.ProcessLocksList },
++#ifdef _WIN64
++      0, 0, { 0 } /* the name pointer does not fit the DWORD debug field */
++#else
+       0, 0, { (DWORD_PTR)(__FILE__ ": typelib loader cache") }
++#endif
+ };
+ static CRITICAL_SECTION cache_section = { &cache_section_debug, -1, 0, 0, 0, 0 };
+ 
+@@ -6688,14 +6693,16 @@ static HRESULT WINAPI ITypeInfo_fnGetIDsOfNames( ITypeInfo2 *iface,
+ }
+ 
+ 
+-#ifdef __i386__
++/* call_method() calls 16-bit code (func is a 16:16 pointer): nothing here
++ * depends on the host CPU, so ARM64 uses the i386 version */
++#if defined(__i386__) || defined(__aarch64__)
+ 
+ extern LONGLONG call_method( void *func, int nb_args, const DWORD *args, int *stack_offset );
+ extern double call_double_method( void *func, int nb_args, const DWORD *args, int *stack_offset );
+ LONGLONG call_method(void *func, int nb_args, const DWORD *args, int *stack_offset)
+ {
+     DWORD ret;
+-    WOWCallback16Ex(func, WCB16_PASCAL, nb_args * 2, args, &ret);
++    WOWCallback16Ex((DWORD)(ULONG_PTR)func, WCB16_PASCAL, nb_args * 2, (LPVOID)args, &ret);
+     return ret;
+ }
+ double call_double_method(void *func, int nb_args, const DWORD *args, int *stack_offset)
+@@ -7060,8 +7067,10 @@ DispCallFunc16(
+     argspos = 2;
+     if (pvInstance)
+     {
+-        const FARPROC *vtable = *(FARPROC **)MapSL(pvInstance); /* We expect pvInstance to be segmented pointer.!? */
+-        func = ((SEGPTR*)MapSL(vtable))[oVft/sizeof(void *)];
++        /* We expect pvInstance to be segmented pointer.!? The 16-bit vtable holds 16:16 pointers */
++        SEGPTR vtable = *(SEGPTR *)MapSL(pvInstance);
++        /* oVft is scaled to native pointers (see ptr_size), the entries are 16:16 */
++        func = (void *)(ULONG_PTR)((SEGPTR*)MapSL(vtable))[oVft/sizeof(void *)];
+         WRITE_DWORD((DWORD)pvInstance); /* the This pointer is always the first parameter */
+     }
+     else func = (void *)oVft;
+@@ -7119,8 +7128,14 @@ DispCallFunc16(
+         break;
+     case VT_DECIMAL:
+     case VT_VARIANT:
+-        args[0] = (DWORD)pvargResult;  /* arg 0 is a pointer to the result */
++    {
++        /* arg 0 is a 16:16 pointer to the result (was a truncated flat pointer) */
++        SEGPTR result16 = MapLS(pvargResult);
++        args[0] = LOWORD(result16);
++        args[1] = HIWORD(result16);
+         call_method( func, argspos, args, &stack_offset );
++        UnMapLS(result16);
++    }
+         break;
+     case VT_I8:
+     case VT_UI8:
+@@ -7571,13 +7586,14 @@ static inline BOOL func_restricted( const FUNCDESC *desc )
+ #define INVBUF_GET_ARG_TYPE_ARRAY(buffer, params) \
+     ((VARTYPE *)((char *)(buffer) + (sizeof(VARIANTARG) + sizeof(VARIANTARG) + sizeof(VARIANTARG *)) * (params)))
+ 
++/* the argument pointer array stays on the 32-bit side (DispCallFunc16) */
+ #define INVBUF_ELEMENT_SIZE16 \
+-    (sizeof(VARIANTARG16) + sizeof(VARIANTARG16) + sizeof(SEGPTR) + sizeof(VARTYPE))
++    (sizeof(VARIANTARG16) + sizeof(VARIANTARG16) + sizeof(VARIANTARG16 *) + sizeof(VARTYPE))
+ #define INVBUF_GET_ARG_ARRAY16(buffer, params) (buffer)
+ #define INVBUF_GET_MISSING_ARG_ARRAY16(buffer, params) \
+     ((VARIANTARG16 *)((char *)(buffer) + sizeof(VARIANTARG16) * (params)))
+ #define INVBUF_GET_ARG_PTR_ARRAY16(buffer, params) \
+-    ((/*VARIANTARG16 * */SEGPTR *)((char *)(buffer) + (sizeof(VARIANTARG16) + sizeof(VARIANTARG16)) * (params)))
++    ((VARIANTARG16 **)((char *)(buffer) + (sizeof(VARIANTARG16) + sizeof(VARIANTARG16)) * (params)))
+ #define INVBUF_GET_ARG_TYPE_ARRAY16(buffer, params) \
+     ((VARTYPE *)((char *)(buffer) + (sizeof(VARIANTARG16) + sizeof(VARIANTARG16) + sizeof(VARIANTARG16 *)) * (params)))
+ 
+@@ -7592,7 +7608,7 @@ void map_bstr32_16(SEGPTR *a16, const BSTR *a32)
+     }
+     len = SysStringLen(*a32);
+     len16 = WideCharToMultiByte(CP_ACP, 0, *a32, len, NULL, 0, NULL, NULL);
+-    *a16 = SysAllocStringLen16(NULL, len16);
++    *a16 = SysAllocStringLen16(0, len16);
+     WideCharToMultiByte(CP_ACP, 0, *a32, len, MapSL(*a16), len16, NULL, NULL);
+     ((char*)MapSL(*a16))[len16] = 0;
+ }
+@@ -7670,7 +7686,7 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+             VARIANTARG16 *rgvarg = INVBUF_GET_ARG_ARRAY16(buffer, func_desc->cParams);
+             VARTYPE *rgvt = INVBUF_GET_ARG_TYPE_ARRAY16(buffer, func_desc->cParams);
+             UINT16 cNamedArgs = pDispParams->cNamedArgs;
+-            DISPID *rgdispidNamedArgs = pDispParams->rgdispidNamedArgs;
++            DISPID *rgdispidNamedArgs = (DISPID *)MapSL(pDispParams->rgdispidNamedArgs);
+             UINT16 vargs_converted=0;
+ 
+             hres = S_OK;
+@@ -7783,10 +7799,11 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+                                 V_VARIANTREF(&rgvarg[i]) = V_VARIANTREF(src_arg);
+                             else
+                             {
+-                                VARIANTARG *missing_arg = INVBUF_GET_MISSING_ARG_ARRAY(buffer, func_desc->cParams);
++                                VARIANTARG16 *missing_arg = INVBUF_GET_MISSING_ARG_ARRAY16(buffer, func_desc->cParams);
+                                 if (wParamFlags & PARAMFLAG_FIN)
+                                     hres = VariantCopy16(&missing_arg[i], src_arg);
+-                                V_VARIANTREF(&rgvarg[i]) = &missing_arg[i];
++                                /* FIXME: the mapping is never freed */
++                                V_VARIANTREF(&rgvarg[i]) = MapLS(&missing_arg[i]);
+                             }
+                             V_VT(&rgvarg[i]) = rgvt[i];
+                         }
+@@ -7810,7 +7827,7 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+                             if (hres != S_OK)
+                             {
+                                 ERR("SafeArrayAccessData failed with %x\n", hres);
+-                                SafeArrayDestroy16(a);
++                                SafeArrayDestroy16(sega);
+                                 break;
+                             }
+                             for (j = 0; j < bound.cElements; j++)
+@@ -7819,7 +7836,7 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+                             if (hres != S_OK)
+                             {
+                                 ERR("SafeArrayUnaccessData failed with %x\n", hres);
+-                                SafeArrayDestroy16(a);
++                                SafeArrayDestroy16(sega);
+                                 break;
+                             }
+                             if (rgvt[i] & VT_BYREF)
+@@ -7835,7 +7852,8 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+                                 hres = VariantChangeType16(&missing_arg[i], src_arg, 0, rgvt[i] & ~VT_BYREF);
+                             else
+                                 V_VT(&missing_arg[i]) = rgvt[i] & ~VT_BYREF;
+-                            V_BYREF(&rgvarg[i]) = &V_NONE(&missing_arg[i]);
++                            /* FIXME: the mapping is never freed */
++                            V_BYREF(&rgvarg[i]) = MapLS(&V_NONE(&missing_arg[i]));
+                             V_VT(&rgvarg[i]) = rgvt[i];
+                         }
+                         else if ((rgvt[i] & VT_BYREF) && (rgvt[i] == V_VT(src_arg)))
+@@ -7855,7 +7873,7 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+                         if (FAILED(hres))
+                         {
+                             ERR("failed to convert param %d to %s from %s\n", i,
+-                                debugstr_vt(rgvt[i]), debugstr_variant(src_arg));
++                                debugstr_vt(rgvt[i]), debugstr_variant16(src_arg));
+                             break;
+                         }
+                         prgpvarg[i] = &rgvarg[i];
+@@ -7967,7 +7985,7 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+                     {
+                         if ((rgvt[i] & VT_BYREF) && !(V_VT(arg) & VT_BYREF))
+                         {
+-                            hres = VariantChangeType(arg, &rgvarg[i], 0, V_VT(arg));
++                            hres = VariantChangeType16(arg, &rgvarg[i], 0, V_VT(arg));
+ 
+                             if (FAILED(hres))
+                             {
+@@ -8065,7 +8083,7 @@ static HRESULT CDECL ITypeInfo_fnInvoke16(
+                     SEGPTR pDispatch = V_DISPATCH(pVarResult);
+                     /* Note: not VariantClear; we still need the dispatch
+                      * pointer to be valid */
+-                    VariantInit(pVarResult);
++                    VariantInit16(pVarResult);
+                     hres = IDispatch16_Invoke(pDispatch, DISPID_VALUE, MapLS(&IID_NULL),
+                         GetSystemDefaultLCID(), wFlags,
+                         spDispParams, spVarResult, spExcepInfo, spArgErr);
+@@ -9089,7 +9107,11 @@ static CRITICAL_SECTION_DEBUG app_obj_section_debug =
+ {
+     0, 0, &app_obj_section,
+     { &app_obj_section_debug.ProcessLocksList, &app_obj_section_debug.ProcessLocksList },
++#ifdef _WIN64
++      0, 0, { 0 } /* the name pointer does not fit the DWORD debug field */
++#else
+       0, 0, { (DWORD_PTR)(__FILE__ ": typelib app obj") }
++#endif
+ };
+ static CRITICAL_SECTION app_obj_section = { &app_obj_section_debug, -1, 0, 0, 0, 0 };
+ 
+@@ -9143,7 +9165,8 @@ static HRESULT WINAPI ITypeInfo_fnAddressOfMember( ITypeInfo2 *iface,
+         if (This->typeattr.typekind == TKIND_COCLASS && This->typeattr.wTypeFlags & TYPEFLAG_FAPPOBJECT)
+         {
+             addressof_app_obj(&This->guid, ppv);
+-            *ppv = MapLS(*ppv);
++            /* the value goes to 16-bit code: a 16:16 pointer kept in a PVOID */
++            *ppv = (PVOID)(ULONG_PTR)MapLS(*ppv);
+             return S_OK;
+         }
+         else
+@@ -9186,7 +9209,7 @@ static HRESULT WINAPI ITypeInfo_fnAddressOfMember( ITypeInfo2 *iface,
+ 
+         if (module16)
+         {
+-            *ppv = GetProcAddress16(module16, entryA);
++            *ppv = (PVOID)(ULONG_PTR)GetProcAddress16(module16, entryA); /* 16:16 */
+         }
+         else
+         {
+@@ -9201,7 +9224,7 @@ static HRESULT WINAPI ITypeInfo_fnAddressOfMember( ITypeInfo2 *iface,
+     {
+         if (module16)
+         {
+-            *ppv = GetProcAddress16(module16, MAKEINTRESOURCEA(ordinal));
++            *ppv = (PVOID)(ULONG_PTR)GetProcAddress16(module16, MAKEINTRESOURCEA(ordinal)); /* 16:16 */
+         }
+         else
+         {

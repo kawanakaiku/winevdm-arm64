@@ -1,0 +1,695 @@
+From 85a0184ab1d1fd0380da3d6eccd868476c060f77 Mon Sep 17 00:00:00 2001
+From: u <u@example.com>
+Date: Sat, 7 Nov 2026 12:03:38 +0900
+Subject: [PATCH 10/27] arm64: mmsystem/mci16: widen MCI parameter blocks,
+ yield thunk via NATIVE_CLOSURE, 64-bit handle fixes
+
+---
+ mmsystem/mci16.c | 280 +++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 236 insertions(+), 44 deletions(-)
+
+diff --git a/mmsystem/mci16.c b/mmsystem/mci16.c
+index 66ac6f26..f570c954 100644
+--- a/mmsystem/mci16.c
++++ b/mmsystem/mci16.c
+@@ -69,7 +69,7 @@ char *WINAPI xlate_str_handle(const char *origstr, char *newstr)
+     {
+         int pos1, pos2, hdc16;
+         int count = sscanf(origstr, "%[a-z ]%n%d%n", newstr, &pos1, &hdc16, &pos2);
+-        sprintf(newstr + pos1, " %u%s", HDC_32((HDC16)hdc16), origstr + pos2);
++        sprintf(newstr + pos1, " %u%s", HandleToUlong(HDC_32((HDC16)hdc16)), origstr + pos2);
+         return newstr;
+     }
+     else if (!strncmp(origstr, "setvideo ", 9))
+@@ -81,7 +81,7 @@ char *WINAPI xlate_str_handle(const char *origstr, char *newstr)
+             strncpy(newstr, origstr, pos0);
+             int pos1, pos2, hpal16;
+             int count = sscanf(pal, "%[a-z ]%n%d%n", newstr + pos0, &pos1, &hpal16, &pos2);
+-            sprintf(newstr + pos0 + pos1, " %u%s", HPALETTE_32((HPALETTE16)hpal16), pal + pos2);
++            sprintf(newstr + pos0 + pos1, " %u%s", HandleToUlong(HPALETTE_32((HPALETTE16)hpal16)), pal + pos2);
+             return newstr;
+         }
+     }
+@@ -94,7 +94,7 @@ char *WINAPI xlate_str_handle(const char *origstr, char *newstr)
+             strncpy(newstr, origstr, pos0);
+             int pos1, pos2, hwnd16;
+             int count = sscanf(par, "%[a-z ]%n%d%n", newstr + pos0, &pos1, &hwnd16, &pos2);
+-            sprintf(newstr + pos0 + pos1, " %u%s", HWND_32((HWND16)hwnd16), par + pos2);
++            sprintf(newstr + pos0 + pos1, " %u%s", HandleToUlong(HWND_32((HWND16)hwnd16)), par + pos2);
+             return newstr;
+         }
+     }
+@@ -107,7 +107,7 @@ char *WINAPI xlate_str_handle(const char *origstr, char *newstr)
+             strncpy(newstr, origstr, pos0);
+             int pos1, pos2, hwnd16;
+             int count = sscanf(hand, "%[a-z ]%n%d%n", newstr + pos0, &pos1, &hwnd16, &pos2);
+-            sprintf(newstr + pos0 + pos1, " %u%s", HWND_32((HWND16)hwnd16), hand + pos2);
++            sprintf(newstr + pos0 + pos1, " %u%s", HandleToUlong(HWND_32((HWND16)hwnd16)), hand + pos2);
+             return newstr;
+         }
+     }
+@@ -120,12 +120,12 @@ static void xlate_stat_handle(const char *cmdstr, char *retstr)
+     if (strstr(cmdstr, "window handle"))
+     {
+         DWORD handle = strtoul(retstr, NULL, 10);
+-        itoa(HWND_16(handle), retstr, 10);
++        itoa(HWND_16(LongToHandle(handle)), retstr, 10);
+     }
+     else if (strstr(cmdstr, "palette handle"))
+     {
+         DWORD handle = strtoul(retstr, NULL, 10);
+-        itoa(HPALETTE_16(handle), retstr, 10);
++        itoa(HPALETTE_16(LongToHandle(handle)), retstr, 10);
+     }
+ }
+ 
+@@ -138,11 +138,11 @@ static DWORD fix_play_wait(const char *cmdstr, char *retstr, int retlen, char *w
+     if (waitpos && !waitpos[5])
+     {
+         char sid[20];
+-        sscanf(cmdstr + 5, "%s", &sid);
++        sscanf(cmdstr + 5, "%s", sid);
+         devid = mciGetDeviceIDA(sid);
+         MCI_GETDEVCAPS_PARMS devcaps = {0};
+         devcaps.dwItem = MCI_GETDEVCAPS_DEVICE_TYPE;
+-        mciSendCommandA(devid, MCI_GETDEVCAPS, MCI_GETDEVCAPS_ITEM, &devcaps);
++        mciSendCommandA(devid, MCI_GETDEVCAPS, MCI_GETDEVCAPS_ITEM, (DWORD_PTR)&devcaps);
+         // handle the wait ourselves so to prevent the thread from being blocked for 300ms
+         if (devcaps.dwReturn == MCI_DEVTYPE_DIGITAL_VIDEO)
+         {
+@@ -166,7 +166,7 @@ static DWORD fix_play_wait(const char *cmdstr, char *retstr, int retlen, char *w
+             MSG msg;
+             DWORD test;
+             if (mciDriverYield(devid))
+-                mciSendCommandA(devid, MCI_STOP, 0, &genparm);
++                mciSendCommandA(devid, MCI_STOP, 0, (DWORD_PTR)&genparm);
+             MsgWaitForMultipleObjects(0, 0, FALSE, 300, QS_POSTMESSAGE | QS_SENDMESSAGE);
+             if (PeekMessageA(&msg, wndwait, MM_MCINOTIFY, MM_MCINOTIFY, PM_REMOVE))
+                 break;
+@@ -267,6 +267,56 @@ static LPWSTR MCI_strdupAtoW( LPCSTR str )
+     return ret;
+ }
+ 
++#ifdef _WIN64
++/* ARM64: the 32-bit MCI parameter blocks start with a DWORD_PTR dwCallback, so they are
++ * not layout compatible with the 16-bit ones any more.  For the commands whose block is
++ * "dwCallback + 32-bit members" a widened copy is made: [16-bit block pointer][32-bit block]. */
++static DWORD mci_generic_extra(WORD wMsg)
++{
++    switch (wMsg) {
++    case MCI_PLAY:     return 12;
++    case MCI_SEEK:     return 4;
++    case MCI_SET:      return 48;
++    case MCI_GETDEVCAPS: return 8;
++    case MCI_RECORD:
++    case MCI_COPY:
++    case MCI_CUT:
++    case MCI_DELETE:
++    case MCI_PASTE:    return 28;
++    case MCI_CUE:
++    case MCI_STEP:
++    case MCI_SPIN:     return 4;
++    case MCI_SIGNAL:   return 12;
++    default:           return 0;
++    }
++}
++
++static DWORD_PTR mci_widen_generic(WORD wMsg, DWORD_PTR lParam16)
++{
++    DWORD *p16 = MapSL(lParam16);
++    DWORD extra = mci_generic_extra(wMsg);
++    char *base = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 2 * sizeof(void *) + 8 + extra);
++    MCI_GENERIC_PARMS *p32;
++
++    if (!base) return 0;
++    *(DWORD **)base = p16;
++    p32 = (MCI_GENERIC_PARMS *)(base + sizeof(void *));
++    p32->dwCallback = (DWORD_PTR)HWND_32(p16[0]);
++    memcpy((char *)p32 + sizeof(DWORD_PTR), p16 + 1, extra);
++    return (DWORD_PTR)p32;
++}
++
++static void mci_narrow_generic(WORD wMsg, DWORD_PTR lParam32)
++{
++    char *base = (char *)lParam32 - sizeof(void *);
++    DWORD *p16 = *(DWORD **)base;
++
++    if (p16 && wMsg == MCI_GETDEVCAPS)
++        p16[1] = ((MCI_GETDEVCAPS_PARMS *)lParam32)->dwReturn;
++    HeapFree(GetProcessHeap(), 0, base);
++}
++#endif
++
+ /**************************************************************************
+  * 			MCI_MapMsg16To32W			[internal]
+  */
+@@ -276,7 +326,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+     {
+         if (wMsg == MCI_PLAY)
+         {
+-            *lParam = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MCI_GENERIC_PARMS));
++            *lParam = (DWORD_PTR)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MCI_GENERIC_PARMS));
+             return MMSYSTEM_MAP_OKMEM;
+         }
+         return MMSYSTEM_MAP_OK;
+@@ -295,7 +345,9 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+     case MCI_DELETE:
+     case MCI_GETDEVCAPS:
+ 	/* case MCI_INDEX: */
++#ifndef _WIN64
+     case MCI_LIST:
++#endif
+ 	/* case MCI_MARK: */
+ 	/* case MCI_MONITOR: */
+     case MCI_PASTE:
+@@ -306,19 +358,26 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+     case MCI_RESUME:
+     case MCI_SEEK:
+     case MCI_SET:
++#ifndef _WIN64
+     case MCI_SETAUDIO:
++#endif
+ 	/* case MCI_SETTIMECODE:*/
+     case MCI_SIGNAL:
+     case MCI_SPIN:
+     case MCI_STEP:
+     case MCI_STOP:
+ 	/* case MCI_UNDO: */
++#ifdef _WIN64
++        *lParam = mci_widen_generic(wMsg, *lParam);
++        return *lParam ? MMSYSTEM_MAP_OKMEM : MMSYSTEM_MAP_NOMEM;
++#else
+         {
+             LPMCI_GENERIC_PARMS mgp = MapSL(*lParam);
+-            mgp->dwCallback = HWND_32(mgp->dwCallback);
+-            *lParam = mgp;
++            mgp->dwCallback = (DWORD_PTR)HWND_32(mgp->dwCallback);
++            *lParam = (DWORD_PTR)mgp;
+         }
+         return MMSYSTEM_MAP_OKMEM;
++#endif
+     case MCI_SETVIDEO:
+ 	{
+ 	    LPMCI_DGV_SETVIDEO_PARMSA mdsvp32 =  HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+@@ -328,10 +387,10 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 	    {
+ 		*(LPMCI_DGV_SETVIDEO_PARMS16*)(mdsvp32) = mdsvp16;
+ 		mdsvp32 = (LPMCI_DGV_SETVIDEO_PARMSA)((char*)mdsvp32 + sizeof(LPMCI_DGV_SETVIDEO_PARMS16));
+-		mdsvp32->dwCallback = HWND_32(mdsvp16->dwCallback);
++		mdsvp32->dwCallback = (DWORD_PTR)HWND_32(mdsvp16->dwCallback);
+ 		mdsvp32->dwItem = mdsvp16->dwItem;
+ 		if ((dwFlags & MCI_DGV_SETVIDEO_ITEM) && (mdsvp16->dwItem == MCI_DGV_SETVIDEO_PALHANDLE))
+-		    mdsvp32->dwValue = HPALETTE_32(mdsvp16->dwValue);
++		    mdsvp32->dwValue = HandleToUlong(HPALETTE_32(mdsvp16->dwValue));
+         else if ((dwFlags & MCI_DGV_SETVIDEO_ITEM) && (mdsvp16->dwItem == MCI_AVI_SETVIDEO_DRAW_PROCEDURE))
+         {
+             static void *(*get_video_thunk)(DWORD) = 0;
+@@ -342,7 +401,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+                     get_video_thunk = (void *(*)(DWORD))GetProcAddress(msvideo, "get_video_thunk");
+             }
+             if (get_video_thunk)
+-                mdsvp32->dwValue = get_video_thunk(mdsvp16->dwValue);
++                mdsvp32->dwValue = (DWORD)(ULONG_PTR)get_video_thunk(mdsvp16->dwValue); /* thunk is below 4GB */
+         }
+ 		else
+ 		    mdsvp32->dwValue = mdsvp16->dwValue;
+@@ -351,12 +410,50 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 		    mdsvp32->lpstrAlgorithm = MapSL(mdsvp16->lpstrAlgorithm);
+ 		if (dwFlags & MCI_DGV_SETVIDEO_QUALITY)
+ 		    mdsvp32->lpstrQuality = MapSL(mdsvp16->lpstrQuality);
+-                *lParam = (DWORD)mdsvp32;
++                *lParam = (DWORD_PTR)mdsvp32;
+              } else {
+                  return MMSYSTEM_MAP_NOMEM;
+              }
+ 	}
+ 	return MMSYSTEM_MAP_OKMEM;
++#ifdef _WIN64
++    case MCI_SETAUDIO:
++        {
++            char *base = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(void *) + sizeof(MCI_DGV_SETAUDIO_PARMSA));
++            LPMCI_DGV_SETAUDIO_PARMS16 p16 = MapSL(*lParam);
++            MCI_DGV_SETAUDIO_PARMSA *p32;
++            if (!base) return MMSYSTEM_MAP_NOMEM;
++            *(void **)base = p16;
++            p32 = (MCI_DGV_SETAUDIO_PARMSA *)(base + sizeof(void *));
++            p32->dwCallback = (DWORD_PTR)HWND_32(p16->dwCallback);
++            p32->dwItem = p16->dwItem;
++            p32->dwValue = p16->dwValue;
++            p32->dwOver = p16->dwOver;
++            if (dwFlags & MCI_DGV_SETAUDIO_ALG)
++                p32->lpstrAlgorithm = MapSL(p16->lpstrAlgorithm);
++            if (dwFlags & MCI_DGV_SETAUDIO_QUALITY)
++                p32->lpstrQuality = MapSL(p16->lpstrQuality);
++            *lParam = (DWORD_PTR)p32;
++        }
++        return MMSYSTEM_MAP_OKMEM;
++    case MCI_LIST:
++        {
++            char *base = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(void *) + sizeof(MCI_DGV_LIST_PARMSA));
++            LPMCI_DGV_LIST_PARMS16 p16 = MapSL(*lParam);
++            MCI_DGV_LIST_PARMSA *p32;
++            if (!base) return MMSYSTEM_MAP_NOMEM;
++            *(void **)base = p16;
++            p32 = (MCI_DGV_LIST_PARMSA *)(base + sizeof(void *));
++            p32->dwCallback = (DWORD_PTR)HWND_32(p16->dwCallback);
++            p32->lpstrReturn = MapSL(p16->lpstrReturn);
++            p32->dwLength = p16->dwLength;
++            p32->dwNumber = p16->dwNumber;
++            p32->dwItem = p16->dwItem;
++            p32->lpstrAlgorithm = MapSL(p16->lpstrAlgorithm);
++            *lParam = (DWORD_PTR)p32;
++        }
++        return MMSYSTEM_MAP_OKMEM;
++#endif
+     case MCI_UPDATE:
+         {
+             if (dwFlags & (MCI_DGV_UPDATE_HDC | MCI_DGV_RECT))
+@@ -367,22 +464,27 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+                 if (mdup32) {
+                     *(LPMCI_DGV_UPDATE_PARMS16*)(mdup32) = mdup16;
+                     mdup32 = (LPMCI_DGV_UPDATE_PARMS)((char*)mdup32 + sizeof(LPMCI_DGV_UPDATE_PARMS16));
+-                    mdup32->dwCallback = HWND_32(mdup16->dwCallback);
++                    mdup32->dwCallback = (DWORD_PTR)HWND_32(mdup16->dwCallback);
+                     mdup32->rc.left = mdup16->rc.left;
+                     mdup32->rc.top = mdup16->rc.top;
+                     mdup32->rc.right = mdup16->rc.right;
+                     mdup32->rc.bottom = mdup16->rc.bottom;
+                     mdup32->hDC = HDC_32(mdup16->hDC);
+-                    *lParam = (DWORD)mdup32;
++                    *lParam = (DWORD_PTR)mdup32;
+                 } else {
+                     return MMSYSTEM_MAP_NOMEM;
+                 }
+             }
+             else
+             {
++#ifdef _WIN64
++                *lParam = mci_widen_generic(wMsg, *lParam);
++                if (!*lParam) return MMSYSTEM_MAP_NOMEM;
++#else
+                 LPMCI_GENERIC_PARMS mgp = MapSL(*lParam);
+-                mgp->dwCallback = HWND_32(mgp->dwCallback);
+-                *lParam = mgp;
++                mgp->dwCallback = (DWORD_PTR)HWND_32(mgp->dwCallback);
++                *lParam = (DWORD_PTR)mgp;
++#endif
+             }
+         }
+         return MMSYSTEM_MAP_OKMEM;
+@@ -397,7 +499,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+             if (mdrp32) {
+                 *(LPMCI_DGV_RECT_PARMS16*)(mdrp32) = mdrp16;
+                 mdrp32 = (LPMCI_DGV_RECT_PARMS)((char*)mdrp32 + sizeof(LPMCI_DGV_RECT_PARMS16));
+-                mdrp32->dwCallback = HWND_32(mdrp16->dwCallback);
++                mdrp32->dwCallback = (DWORD_PTR)HWND_32(mdrp16->dwCallback);
+                 mdrp32->rc.left = mdrp16->rc.left;
+                 mdrp32->rc.top = mdrp16->rc.top;
+                 mdrp32->rc.right = mdrp16->rc.right;
+@@ -405,7 +507,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+             } else {
+                 return MMSYSTEM_MAP_NOMEM;
+             }
+-            *lParam = (DWORD)mdrp32;
++            *lParam = (DWORD_PTR)mdrp32;
+         }
+         return MMSYSTEM_MAP_OKMEM;
+     case MCI_STATUS:
+@@ -417,7 +519,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+                 if (mdsp32w) {
+                     *(LPMCI_DGV_STATUS_PARMS16*)(mdsp32w) = mdsp16;
+                     mdsp32w = (LPMCI_DGV_STATUS_PARMSW)((char*)mdsp32w + sizeof(LPMCI_DGV_STATUS_PARMS16));
+-                    mdsp32w->dwCallback = HWND_32(mdsp16->dwCallback);
++                    mdsp32w->dwCallback = (DWORD_PTR)HWND_32(mdsp16->dwCallback);
+                     mdsp32w->dwReturn = mdsp16->dwReturn;
+                     mdsp32w->dwItem = mdsp16->dwItem;
+                     mdsp32w->dwTrack = mdsp16->dwTrack;
+@@ -425,14 +527,29 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+                         mdsp32w->lpstrDrive = MCI_strdupAtoW(MapSL(mdsp16->lpstrDrive));
+                     if (dwFlags & MCI_DGV_STATUS_REFERENCE)
+                         mdsp32w->dwReference = mdsp16->dwReference;
+-                    *lParam = (DWORD)mdsp32w;
++                    *lParam = (DWORD_PTR)mdsp32w;
+                 } else {
+                     return MMSYSTEM_MAP_NOMEM;
+                 }
+             } else {
+-                *lParam = (DWORD)MapSL(*lParam);
++#ifdef _WIN64
++                /* [16-bit block pointer][MCI_STATUS_PARMS] */
++                char *base = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(void *) + sizeof(MCI_STATUS_PARMS));
++                DWORD *p16 = MapSL(*lParam);
++                LPMCI_STATUS_PARMS msp;
++                if (!base) return MMSYSTEM_MAP_NOMEM;
++                *(DWORD **)base = p16;
++                msp = (LPMCI_STATUS_PARMS)(base + sizeof(void *));
++                msp->dwCallback = (DWORD_PTR)HWND_32(p16[0]);
++                msp->dwReturn = p16[1];
++                msp->dwItem = p16[2];
++                msp->dwTrack = p16[3];
++                *lParam = (DWORD_PTR)msp;
++#else
++                *lParam = (DWORD_PTR)MapSL(*lParam);
+                 if(!(dwFlags & MCI_STATUS_ITEM))
+                     return MMSYSTEM_MAP_OK;
++#endif
+             }
+         }
+         return MMSYSTEM_MAP_OKMEM;
+@@ -441,7 +558,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+             LPMCI_OVLY_WINDOW_PARMSW mowp32w = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MCI_OVLY_WINDOW_PARMSW));
+             LPMCI_OVLY_WINDOW_PARMS16 mowp16 = MapSL(*lParam);
+             if (mowp32w) {
+-                mowp32w->dwCallback = HWND_32(mowp16->dwCallback);
++                mowp32w->dwCallback = (DWORD_PTR)HWND_32(mowp16->dwCallback);
+                 mowp32w->hWnd = HWND_32(mowp16->hWnd);
+                 mowp32w->nCmdShow = mowp16->nCmdShow;
+                 if (dwFlags & (MCI_DGV_WINDOW_TEXT | MCI_OVLY_WINDOW_TEXT))
+@@ -449,7 +566,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+             } else {
+                 return MMSYSTEM_MAP_NOMEM;
+             }
+-            *lParam = (DWORD)mowp32w;
++            *lParam = (DWORD_PTR)mowp32w;
+         }
+         return MMSYSTEM_MAP_OKMEM;
+     case MCI_ESCAPE:
+@@ -458,12 +575,12 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 	    LPMCI_VD_ESCAPE_PARMS16	mvep16  = MapSL(*lParam);
+ 
+ 	    if (mvep32w) {
+-		mvep32w->dwCallback       = HWND_32(mvep16->dwCallback);
++		mvep32w->dwCallback       = (DWORD_PTR)HWND_32(mvep16->dwCallback);
+ 		mvep32w->lpstrCommand     = MCI_strdupAtoW(MapSL(mvep16->lpstrCommand));
+ 	    } else {
+ 		return MMSYSTEM_MAP_NOMEM;
+ 	    }
+-	    *lParam = (DWORD)mvep32w;
++	    *lParam = (DWORD_PTR)mvep32w;
+ 	}
+ 	return MMSYSTEM_MAP_OKMEM;
+     case MCI_INFO:
+@@ -474,7 +591,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 	    if (mip32w) {
+ 		*(LPMCI_DGV_INFO_PARMS16*)(mip32w) = mip16;
+ 		mip32w = (LPMCI_DGV_INFO_PARMSW)((char*)mip32w + sizeof(LPMCI_DGV_INFO_PARMS16));
+-		mip32w->dwCallback  = HWND_32(mip16->dwCallback);
++		mip32w->dwCallback  = (DWORD_PTR)HWND_32(mip16->dwCallback);
+ 		mip32w->lpstrReturn = HeapAlloc(GetProcessHeap(), 0, mip16->dwRetSize * sizeof(WCHAR));
+ 		mip32w->dwRetSize   = mip16->dwRetSize;
+ 		if (dwFlags & MCI_DGV_INFO_ITEM)
+@@ -482,7 +599,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 	    } else {
+ 		return MMSYSTEM_MAP_NOMEM;
+ 	    }
+-	    *lParam = (DWORD)mip32w;
++	    *lParam = (DWORD_PTR)mip32w;
+ 	}
+ 	return MMSYSTEM_MAP_OKMEM;
+     case MCI_OPEN:
+@@ -494,7 +611,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 	    if (mop32w) {
+ 		*(LPMCI_OPEN_PARMS16*)(mop32w) = mop16;
+ 		mop32w = (LPMCI_OPEN_PARMSW)((char*)mop32w + sizeof(LPMCI_OPEN_PARMS16));
+-		mop32w->dwCallback       = HWND_32(mop16->dwCallback);
++		mop32w->dwCallback       = (DWORD_PTR)HWND_32(mop16->dwCallback);
+ 		mop32w->wDeviceID        = mop16->wDeviceID;
+                 if ( ( dwFlags & ( MCI_OPEN_TYPE | MCI_OPEN_TYPE_ID)) == MCI_OPEN_TYPE)
+                     mop32w->lpstrDeviceType  = MCI_strdupAtoW(MapSL(mop16->lpstrDeviceType));
+@@ -524,7 +641,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 	    } else {
+ 		return MMSYSTEM_MAP_NOMEM;
+ 	    }
+-	    *lParam = (DWORD)mop32w;
++	    *lParam = (DWORD_PTR)mop32w;
+ 	}
+ 	return MMSYSTEM_MAP_OKMEM;
+     case MCI_SYSINFO:
+@@ -539,7 +656,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+         origmsip32w = msip32w;
+         *(MCI_SYSINFO_PARMS16 **)msip32w = msip16;
+         msip32w = (MCI_SYSINFO_PARMSW *)((char *)msip32w + sizeof(MCI_OPEN_PARMS16 *));
+-        msip32w->dwCallback       = HWND_32(msip16->dwCallback);
++        msip32w->dwCallback       = (DWORD_PTR)HWND_32(msip16->dwCallback);
+         msip32w->lpstrReturn      = HeapAlloc(GetProcessHeap(), 0, (dwFlags & MCI_SYSINFO_QUANTITY) ?
+                                                                     sizeof(DWORD) :
+                                                                     msip16->dwRetSize * sizeof(WCHAR));
+@@ -552,7 +669,7 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+         msip32w->dwNumber         = msip16->dwNumber;
+         msip32w->wDeviceType      = msip16->wDeviceType;
+ 
+-        *lParam = (DWORD)msip32w;
++        *lParam = (DWORD_PTR)msip32w;
+     }
+ 	return MMSYSTEM_MAP_OKMEM;
+     case MCI_SOUND:
+@@ -561,12 +678,12 @@ static MMSYSTEM_MapType	MCI_MapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR* l
+ 	    LPMCI_SOUND_PARMS16		mbp16 = MapSL(*lParam);
+ 
+ 	    if (mbp32) {
+-		mbp32->dwCallback = HWND_32(mbp16->dwCallback);
++		mbp32->dwCallback = (DWORD_PTR)HWND_32(mbp16->dwCallback);
+ 		mbp32->lpstrSoundName = MCI_strdupAtoW(MapSL(mbp16->lpstrSoundName));
+ 	    } else {
+ 		return MMSYSTEM_MAP_NOMEM;
+ 	    }
+-	    *lParam = (DWORD)mbp32;
++	    *lParam = (DWORD_PTR)mbp32;
+ 	}
+ 	return MMSYSTEM_MAP_OKMEM;
+     case DRV_LOAD:
+@@ -604,7 +721,17 @@ static  void	MCI_UnMapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR lParam, DWO
+     case MCI_CUT:
+     case MCI_DELETE:
+     case MCI_GETDEVCAPS:
++#ifdef _WIN64
++        if (lParam)
++            mci_narrow_generic(wMsg, lParam);
++        break;
++    case MCI_LIST:
++        if (lParam)
++            HeapFree(GetProcessHeap(), 0, (char *)lParam - sizeof(void *));
++        break;
++#else
+     case MCI_LIST:
++#endif
+     case MCI_PASTE:
+     case MCI_PAUSE:
+     case MCI_PLAY:
+@@ -613,16 +740,28 @@ static  void	MCI_UnMapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR lParam, DWO
+     case MCI_RESUME:
+     case MCI_SEEK:
+     case MCI_SET:
++#ifndef _WIN64
+     case MCI_SETAUDIO:
++#endif
+     case MCI_SPIN:
+     case MCI_STEP:
+     case MCI_STOP:
+     case MCI_SIGNAL:
+         if (lParam) {
++#ifdef _WIN64
++            mci_narrow_generic(wMsg, lParam);
++#else
+             LPMCI_GENERIC_PARMS mgp = (LPMCI_GENERIC_PARMS)lParam;
+             mgp->dwCallback = HWND_16(mgp->dwCallback);
++#endif
+         }
+         break;
++#ifdef _WIN64
++    case MCI_SETAUDIO:
++        if (lParam)
++            HeapFree(GetProcessHeap(), 0, (char *)lParam - sizeof(void *));
++        break;
++#endif
+ 
+     case MCI_SETVIDEO:
+ 	if (lParam) {
+@@ -637,8 +776,12 @@ static  void	MCI_UnMapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR lParam, DWO
+             HeapFree(GetProcessHeap(), 0, base);
+         }
+         else if (lParam) {
++#ifdef _WIN64
++            mci_narrow_generic(wMsg, lParam);
++#else
+             LPMCI_GENERIC_PARMS mgp = (LPMCI_GENERIC_PARMS)lParam;
+             mgp->dwCallback = HWND_16(mgp->dwCallback);
++#endif
+         }
+     break;
+             
+@@ -667,12 +810,29 @@ static  void	MCI_UnMapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR lParam, DWO
+                 HeapFree(GetProcessHeap(), 0, (LPVOID)mdsp32w->lpstrDrive);
+                 HeapFree(GetProcessHeap(), 0, base);
+             }
++#ifdef _WIN64
++            else
++            {
++                LPMCI_STATUS_PARMS msp = (LPMCI_STATUS_PARMS)lParam;
++                char *base = (char *)lParam - sizeof(void *);
++                DWORD *p16 = *(DWORD **)base;
++                if (dwFlags & MCI_STATUS_ITEM)
++                {
++                    if (msp->dwItem == 0x4001) // MCI_DGV_STATUS_HWND
++                        p16[1] = (DWORD)HWND_16((HWND)(msp->dwReturn));
++                    else
++                        p16[1] = (DWORD)msp->dwReturn;
++                }
++                HeapFree(GetProcessHeap(), 0, base);
++            }
++#else
+             else if (dwFlags & MCI_STATUS_ITEM)
+             {
+                LPMCI_STATUS_PARMS msp = lParam;
+                if (msp->dwItem == 0x4001) // MCI_DGV_STATUS_HWND
+                    msp->dwReturn = (DWORD_PTR)HWND_16((HWND)(msp->dwReturn));
+             }
++#endif
+         }
+         break;
+     case MCI_WINDOW:
+@@ -762,21 +922,32 @@ static  void	MCI_UnMapMsg16To32W(WORD wMsg, DWORD dwFlags, DWORD_PTR lParam, DWO
+  * ###################################################
+  */
+ 
++#ifdef __aarch64__
++#include "wine/native_thunk.h"
++#else
+ #include <pshpack1.h>
++#endif
+ #define MCI_MAX_THUNKS      32
+ 
+ static struct mci_thunk
+ {
++#ifdef __aarch64__
++    NATIVE_CLOSURE closure;     /* calls MCI_Yield1632_native(thunk, id, data) */
++    YIELDPROC16 yield16;
++#else
+     BYTE        popl_eax;       /* popl  %eax (return address) */
+     BYTE        pushl_func;     /* pushl $pfn16 (16bit callback function) */
+     YIELDPROC16 yield16;
+     BYTE        pushl_eax;      /* pushl %eax */
+     BYTE        jmp;            /* ljmp MCI_Yield1632 */
+     DWORD       callback;
++#endif
+     MCIDEVICEID id;
+ } *MCI_Thunks;
+ 
++#ifndef __aarch64__
+ #include <poppack.h>
++#endif
+ 
+ static CRITICAL_SECTION mci_cs;
+ static CRITICAL_SECTION_DEBUG mci_critsect_debug =
+@@ -811,6 +982,13 @@ static UINT MCI_Yield1632(DWORD pfn16, MCIDEVICEID id, DWORD yield_data)
+     return WOWCallback16Ex(pfn16, WCB16_PASCAL, sizeof(args), args, NULL);
+ }
+ 
++#ifdef __aarch64__
++static UINT MCI_Yield1632_native(struct mci_thunk *thunk, MCIDEVICEID id, DWORD yield_data)
++{
++    return MCI_Yield1632(thunk->yield16, id, yield_data);
++}
++#endif
++
+ /******************************************************************
+  *		MCI_AddThunk
+  *
+@@ -826,12 +1004,17 @@ static struct mci_thunk*       MCI_AddThunk(MCIDEVICEID id, YIELDPROC16 pfn16)
+          if (!MCI_Thunks) return NULL;
+          for (thunk = MCI_Thunks; thunk < &MCI_Thunks[MCI_MAX_THUNKS]; thunk++)
+          {
++#ifdef __aarch64__
++             init_native_closure(&thunk->closure, thunk, MCI_Yield1632_native);
++             thunk->yield16      = 0;
++#else
+              thunk->popl_eax     = 0x58;   /* popl  %eax */
+              thunk->pushl_func   = 0x68;   /* pushl $pfn16 */
+              thunk->yield16      = 0;
+              thunk->pushl_eax    = 0x50;   /* pushl %eax */
+              thunk->jmp          = 0xe9;   /* jmp MCI_Yield1632 */
+              thunk->callback     = (char *)MCI_Yield1632 - (char *)(&thunk->callback + 1);
++#endif
+              thunk->id           = 0;
+          }
+      }
+@@ -859,7 +1042,11 @@ static struct mci_thunk*    MCI_HasThunk(YIELDPROC pfn)
+     if (!MCI_Thunks) return NULL;
+     for (thunk = MCI_Thunks; thunk < &MCI_Thunks[MCI_MAX_THUNKS]; thunk++)
+     {
++#ifdef __aarch64__
++        if ((YIELDPROC)&thunk->closure == pfn) return thunk;
++#else
+         if ((YIELDPROC)thunk == pfn) return thunk;
++#endif
+     }
+     return NULL;
+ }
+@@ -876,8 +1063,13 @@ BOOL16 WINAPI mciSetYieldProc16(UINT16 uDeviceID, YIELDPROC16 fpYieldProc, DWORD
+ 
+     if (!(thunk = MCI_AddThunk(uDeviceID, fpYieldProc)))
+         return FALSE;
++    
++#ifdef __aarch64__
++    ret = mciSetYieldProc(uDeviceID, (YIELDPROC)&thunk->closure, dwYieldData);
++#else
+     ret = mciSetYieldProc(uDeviceID, (YIELDPROC)thunk, dwYieldData);
+-    if (!ret) thunk->yield16 = NULL;
++#endif
++    if (!ret) thunk->yield16 = 0;
+     return ret;
+ }
+ 
+@@ -893,7 +1085,7 @@ YIELDPROC16 WINAPI mciGetYieldProc16(UINT16 uDeviceID, DWORD* lpdwYieldData)
+     TRACE("(%u, %p)\n", uDeviceID, lpdwYieldData);
+ 
+     yield = mciGetYieldProc(uDeviceID, &data);
+-    if (!yield || !(thunk = MCI_HasThunk(yield))) return NULL;
++    if (!yield || !(thunk = MCI_HasThunk(yield))) return 0;
+ 
+     if (lpdwYieldData) *lpdwYieldData = data;
+     return thunk->yield16;
+@@ -979,7 +1171,7 @@ DWORD WINAPI mciSendCommand16(UINT16 wDevID, UINT16 wMsg, DWORD dwParam1, DWORD
+         {
+             MCI_GETDEVCAPS_PARMS devcaps = {0};
+             devcaps.dwItem = MCI_GETDEVCAPS_DEVICE_TYPE;
+-            mciSendCommandA(wDevID, MCI_GETDEVCAPS, MCI_GETDEVCAPS_ITEM, &devcaps);
++            mciSendCommandA(wDevID, MCI_GETDEVCAPS, MCI_GETDEVCAPS_ITEM, (DWORD_PTR)&devcaps);
+             // handle the wait ourselves so to prevent the thread from being blocked for 300ms
+             if (devcaps.dwReturn == MCI_DEVTYPE_DIGITAL_VIDEO)
+             {
+@@ -1011,14 +1203,14 @@ DWORD WINAPI mciSendCommand16(UINT16 wDevID, UINT16 wMsg, DWORD dwParam1, DWORD
+         case MMSYSTEM_MAP_OK:
+         case MMSYSTEM_MAP_OKMEM:
+             if (wndwait)
+-                ((MCI_GENERIC_PARMS *)dwParam2)->dwCallback = wndwait;
++                ((MCI_GENERIC_PARMS *)dwParam2)->dwCallback = (DWORD_PTR)wndwait;
+             ReleaseThunkLock(&count);
+             dwRet = mciSendCommandW(wDevID, wMsg, dwParam1, dwParam2);
+             RestoreThunkLock(count);
+             if (res == MMSYSTEM_MAP_OKMEM)
+             {
+                 if (!p2)
+-                    HeapFree(GetProcessHeap(), 0, dwParam2);
++                    HeapFree(GetProcessHeap(), 0, (LPVOID)dwParam2);
+                 else
+                     MCI_UnMapMsg16To32W(wMsg, dwParam1, dwParam2, dwRet);
+             }
+@@ -1043,7 +1235,7 @@ DWORD WINAPI mciSendCommand16(UINT16 wDevID, UINT16 wMsg, DWORD dwParam1, DWORD
+         for (i = 0; i < MCI_MAX_THUNKS; i++)
+         {
+             if (MCI_Thunks[i].id == wDevID)
+-                MCI_Thunks[i].yield16 = NULL;
++                MCI_Thunks[i].yield16 = 0;
+         }
+     }
+     if (!dwRet && (wMsg == MCI_OPEN))
+@@ -1061,7 +1253,7 @@ DWORD WINAPI mciSendCommand16(UINT16 wDevID, UINT16 wMsg, DWORD dwParam1, DWORD
+             MSG msg;
+             DWORD test;
+             if (mciDriverYield(wDevID))
+-                mciSendCommandA(wDevID, MCI_STOP, 0, &genparm);
++                mciSendCommandA(wDevID, MCI_STOP, 0, (DWORD_PTR)&genparm);
+             MsgWaitForMultipleObjects(0, 0, FALSE, 300, QS_POSTMESSAGE | QS_SENDMESSAGE);
+             if (PeekMessageA(&msg, wndwait, MM_MCINOTIFY, MM_MCINOTIFY, PM_REMOVE))
+                 break;

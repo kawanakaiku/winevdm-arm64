@@ -1,0 +1,96 @@
+From 84f4bd468d8204a1586f51ec664940fa6ebdcabd Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:12:07 +0900
+Subject: [PATCH 17/27] arm64: user, winhlp32: 64-bit va_list for
+ FormatMessage16, pointer sized index_data.offset
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ user/user.c        | 20 +++++++++++++++++++-
+ winhlp32/winhelp.c |  8 ++++----
+ winhlp32/winhelp.h |  2 +-
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/user/user.c b/user/user.c
+index c0338661..83d5941e 100644
+--- a/user/user.c
++++ b/user/user.c
+@@ -4216,9 +4216,27 @@ DWORD WINAPI FormatMessage16(
+                         LPSTR   b = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sz = 100);
+ 
+                         argliststart=args+insertnr-1;
++#ifdef _WIN64
++                        /* the va_list of 64-bit hosts has pointer sized slots: widen the
++                         * 32-bit arguments (one format spec uses at most 3 of them) */
++                        ULONG_PTR arglist64[3] = { 0 };
++                        __TRY
++                        {
++                            for (int i = 0; i < sizeof(arglist64) / sizeof(arglist64[0]); i++)
++                                arglist64[i] = argliststart[i];
++                        }
++                        __EXCEPT_ALL
++                        {
++                            /* end of the 16-bit argument array */
++                        }
++                        __ENDTRY
++#define FORMAT16_VA_LIST ((va_list)arglist64)
++#else
++#define FORMAT16_VA_LIST ((va_list)argliststart)
++#endif
+ 
+                         /* CMF - This makes a BIG assumption about va_list */
+-                        while ((ret = vsnprintf(b, sz, fmtstr, (va_list) argliststart)) < 0 || ret >= sz) {
++                        while ((ret = vsnprintf(b, sz, fmtstr, FORMAT16_VA_LIST)) < 0 || ret >= sz) {
+                             LPSTR new_b;
+                             sz = (ret == -1 ? sz + 100 : ret + 1);
+                             new_b = HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, b, sz);
+diff --git a/winhlp32/winhelp.c b/winhlp32/winhelp.c
+index 9b27895b..03c8e7de 100644
+--- a/winhlp32/winhelp.c
++++ b/winhlp32/winhelp.c
+@@ -151,7 +151,7 @@ BOOL WINHELP_SearchKey(char keyfile, LPCSTR keywords, LONG type, LPCSTR topic, L
+         struct index_data idx;
+         idx.hlpfile = page->file;
+         idx.jump = FALSE;
+-        idx.offset = (ULONG)ids;
++        idx.offset = (ULONG_PTR)ids;
+         idx.count = idn;
+         t = DialogBoxParamA(NULL, MAKEINTRESOURCE(IDD_TOPIC), currwin->hMainWnd, WINHELP_TopicDlgProc, (LPARAM)&idx);
+         if (t == 0xFFFFFFFF) return FALSE;
+@@ -1715,12 +1715,12 @@ static INT_PTR CALLBACK WINHELP_IndexDlgProc(HWND hWnd, UINT msg, WPARAM wParam,
+                 p += strlen((char *)p);
+                 id->count = *(short*)((char *)p + 1);
+                 id->offset = *(ULONG*)((char *)p + 3);
+-                id->offset = (DWORD)(id->hlpfile->xw[0].data + id->offset + 9);
++                id->offset = (ULONG_PTR)(id->hlpfile->xw[0].data + id->offset + 9);
+                 if (id->count > 1)
+                 {
+                     if (id->hlpfile->ttlbtree)
+                     {
+-                        id->offset = DialogBoxParamW(NULL, MAKEINTRESOURCE(IDD_TOPIC), hWnd, WINHELP_TopicDlgProc, (LPARAM)id);
++                        id->offset = (ULONG)DialogBoxParamW(NULL, MAKEINTRESOURCE(IDD_TOPIC), hWnd, WINHELP_TopicDlgProc, (LPARAM)id);
+                         if (id->offset == 0xFFFFFFFF)
+                             return TRUE;
+                     }
+@@ -2098,7 +2098,7 @@ BOOL WINHELP_CreateIndexWindow(BOOL is_search)
+     PropertySheetW(&psHead);
+     if (id.jump)
+     {
+-        WINE_TRACE("got %d as an offset\n", id.offset);
++        WINE_TRACE("got %d as an offset\n", (ULONG)id.offset);
+         WINHELP_OpenHelpWindow(HLPFILE_PageByOffset, id.hlpfile, id.offset,
+                                Globals.active_win->info, SW_NORMAL);
+     }
+diff --git a/winhlp32/winhelp.h b/winhlp32/winhelp.h
+index 5d6c6a42..41169fd1 100644
+--- a/winhlp32/winhelp.h
++++ b/winhlp32/winhelp.h
+@@ -171,7 +171,7 @@ struct index_data
+ {
+     HLPFILE*    hlpfile;
+     BOOL        jump;
+-    ULONG       offset;
++    ULONG_PTR   offset;     /* topic offset, or a pointer to the topic offsets */
+     WORD        count;
+ };
+ 

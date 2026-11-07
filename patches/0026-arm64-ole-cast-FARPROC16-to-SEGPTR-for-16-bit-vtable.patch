@@ -1,0 +1,69 @@
+From 741a359179525253227d78712c7233ec43d1ca35 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:16:51 +0900
+Subject: [PATCH 26/27] arm64: ole: cast FARPROC16 to SEGPTR for 16-bit vtable
+ entries
+
+FARPROC16 is a function pointer type on i386; keep the i386 build
+free of integer/pointer conversion errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ compobj/compobj.c    | 2 +-
+ ole2/hglobalstream.c | 2 +-
+ ole2/memlockbytes.c  | 2 +-
+ olesvr/olesvr.c      | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/compobj/compobj.c b/compobj/compobj.c
+index 42d4ffd2..7dd64be5 100644
+--- a/compobj/compobj.c
++++ b/compobj/compobj.c
+@@ -205,7 +205,7 @@ IMalloc16_Constructor(void)
+     This = HeapAlloc( GetProcessHeap(), 0, sizeof(IMalloc16Impl) );
+     if (!msegvt16)
+     {
+-#define VTENT(x) vt16.x = GetProcAddress16(hcomp,"IMalloc16_"#x);assert(vt16.x)
++#define VTENT(x) vt16.x = (SEGPTR)GetProcAddress16(hcomp,"IMalloc16_"#x);assert(vt16.x)
+         VTENT(QueryInterface);
+         VTENT(AddRef);
+         VTENT(Release);
+diff --git a/ole2/hglobalstream.c b/ole2/hglobalstream.c
+index a3ba271e..4453137a 100644
+--- a/ole2/hglobalstream.c
++++ b/ole2/hglobalstream.c
+@@ -596,7 +596,7 @@ HRESULT WINAPI CreateStreamOnHGlobal16(
+   if (!SegHGLOBALStreamImplVtbl)
+   {
+       HMODULE16 hole = GetModuleHandle16("OLE2");
+-#define VTENT(x) HGLOBALStreamImplVtbl.x = GetProcAddress16(hole,"HGLOBALStreamImpl16_"#x);assert(HGLOBALStreamImplVtbl.x)
++#define VTENT(x) HGLOBALStreamImplVtbl.x = (SEGPTR)GetProcAddress16(hole,"HGLOBALStreamImpl16_"#x);assert(HGLOBALStreamImplVtbl.x)
+       VTENT(QueryInterface);
+       VTENT(AddRef);
+       VTENT(Release);
+diff --git a/ole2/memlockbytes.c b/ole2/memlockbytes.c
+index 6fa4bd58..5f3d146c 100644
+--- a/ole2/memlockbytes.c
++++ b/ole2/memlockbytes.c
+@@ -111,7 +111,7 @@ HGLOBALLockBytesImpl16_Construct(HGLOBAL16 hGlobal,
+   if (!msegvt16)
+   {
+       HMODULE16 hcomp = GetModuleHandle16("OLE2");
+-#define VTENT(x) vt16.x = GetProcAddress16(hcomp,"HGLOBALLockBytesImpl16_"#x);assert(vt16.x)
++#define VTENT(x) vt16.x = (SEGPTR)GetProcAddress16(hcomp,"HGLOBALLockBytesImpl16_"#x);assert(vt16.x)
+       VTENT(QueryInterface);
+       VTENT(AddRef);
+       VTENT(Release);
+diff --git a/olesvr/olesvr.c b/olesvr/olesvr.c
+index 4c30a9f7..ae0ae47a 100644
+--- a/olesvr/olesvr.c
++++ b/olesvr/olesvr.c
+@@ -451,7 +451,7 @@ OLESTATUS CALLBACK ole_doc_GetObject(LPOLESERVERDOC document, OLE_LPCSTR name, L
+     DWORD ret;
+     if (!oleclientvtbl16)
+     {
+-        oleclientvtbl16 = GetProcAddress16(GetModuleHandle16("OLESVR"), "ITEMCALLBACK");
++        oleclientvtbl16 = (SEGPTR)GetProcAddress16(GetModuleHandle16("OLESVR"), "ITEMCALLBACK");
+         ptrvtbl16 = MapLS(&oleclientvtbl16);
+     }
+     /* the 16-bit code reads lpvtbl as a 16:16 pointer */

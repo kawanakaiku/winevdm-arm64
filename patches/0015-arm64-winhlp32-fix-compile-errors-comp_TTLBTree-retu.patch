@@ -1,0 +1,184 @@
+From fccbab1207f25d1869626bdf2d315b9d2f85a234 Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:07:19 +0900
+Subject: [PATCH 15/27] arm64: winhlp32: fix compile errors, comp_TTLBTree
+ returns int
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ winhlp32/hlpfile.c |  4 ++--
+ winhlp32/hlpfile.h |  1 +
+ winhlp32/winhelp.c | 37 +++++++++++++++++++------------------
+ 3 files changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/winhlp32/hlpfile.c b/winhlp32/hlpfile.c
+index fd5bdbfc..716b5641 100644
+--- a/winhlp32/hlpfile.c
++++ b/winhlp32/hlpfile.c
+@@ -2433,13 +2433,13 @@ static BOOL HLPFILE_SystemCommands(HLPFILE* hlpfile)
+     if ((hlpfile->charset != DEFAULT_CHARSET) && (hlpfile->charset != ANSI_CHARSET))
+     {
+         CHARSETINFO info;
+-        TranslateCharsetInfo(hlpfile->charset, &info, TCI_SRCCHARSET);
++        TranslateCharsetInfo((DWORD *)(DWORD_PTR)hlpfile->charset, &info, TCI_SRCCHARSET);
+         hlpfile->codepage = info.ciACP;
+     }
+     else if (lcid)
+     {
+         CHARSETINFO info;
+-        if (TranslateCharsetInfo(lcid, &info, TCI_SRCLOCALE))
++        if (TranslateCharsetInfo((DWORD *)(DWORD_PTR)lcid, &info, TCI_SRCLOCALE))
+         {
+             hlpfile->codepage = info.ciACP;
+             hlpfile->charset = info.ciCharset;
+diff --git a/winhlp32/hlpfile.h b/winhlp32/hlpfile.h
+index e5c7a6e8..a262f606 100644
+--- a/winhlp32/hlpfile.h
++++ b/winhlp32/hlpfile.h
+@@ -213,6 +213,7 @@ LONG          HLPFILE_Hash(LPCSTR lpszContext);
+ void          HLPFILE_FreeHlpFile(HLPFILE*);
+ HLPFILE_XW *HLPFILE_GetTreeData(HLPFILE *hlpfile, char keyfile);
+ void  HLPFILE_BPTreeEnum(BYTE*, HLPFILE_BPTreeCallback cb, void *cookie);
++void* HLPFILE_BPTreeSearch(BYTE* buf, const void* key, HLPFILE_BPTreeCompare comp);
+ 
+ struct RtfData {
+     BOOL        in_text;
+diff --git a/winhlp32/winhelp.c b/winhlp32/winhelp.c
+index dc88b0b6..9b27895b 100644
+--- a/winhlp32/winhelp.c
++++ b/winhlp32/winhelp.c
+@@ -153,7 +153,7 @@ BOOL WINHELP_SearchKey(char keyfile, LPCSTR keywords, LONG type, LPCSTR topic, L
+         idx.jump = FALSE;
+         idx.offset = (ULONG)ids;
+         idx.count = idn;
+-        t = DialogBoxParamA(NULL, MAKEINTRESOURCE(IDD_TOPIC), currwin->hMainWnd, WINHELP_TopicDlgProc, &idx);
++        t = DialogBoxParamA(NULL, MAKEINTRESOURCE(IDD_TOPIC), currwin->hMainWnd, WINHELP_TopicDlgProc, (LPARAM)&idx);
+         if (t == 0xFFFFFFFF) return FALSE;
+     }
+     else
+@@ -202,13 +202,13 @@ static void WINHELP_SetupText(HWND hTextWnd, WINHELP_WINDOW* win, ULONG relative
+             find.chrg.cpMax = -1;
+             find.lpstrText = &tmp;
+             swprintf(tmp, 32, search, relative);
+-            cp = SendMessageW(hTextWnd, EM_FINDTEXTW, FR_DOWN, &find);
++            cp = SendMessageW(hTextWnd, EM_FINDTEXTW, FR_DOWN, (LPARAM)&find);
+         }
+         SendMessageW(hTextWnd, EM_POSFROMCHAR, (WPARAM)&ptl, cp || (cp != -1) ? cp - 1 : 0);
+         pt.x = 0; pt.y = ptl.y;
+         SendMessageW(hTextWnd, EM_SETSCROLLPOS, 0, (LPARAM)&pt);
+         IRichEditOle *reole;
+-        SendMessageW(hTextWnd, EM_GETOLEINTERFACE, 0, &reole);
++        SendMessageW(hTextWnd, EM_GETOLEINTERFACE, 0, (LPARAM)&reole);
+         if (rd.first_hs)
+         {
+             REOBJECT obj = {sizeof(REOBJECT)};
+@@ -857,13 +857,13 @@ static HLPFILE_HOTSPOTLINK* WINHELP_FindHotSpot(WINHELP_WINDOW* win, LPARAM pos)
+     int x = LOWORD(pos), y = HIWORD(pos);
+     POINTL pntl = {x, y};
+     HWND hwndtext = GetDlgItem(win->hMainWnd, CTL_ID_TEXT);
+-    LRESULT cp = SendMessageW(hwndtext, EM_CHARFROMPOS, 0, &pntl);
++    LRESULT cp = SendMessageW(hwndtext, EM_CHARFROMPOS, 0, (LPARAM)&pntl);
+     HLPFILE_HOTSPOTLINK* hs = win->page->first_hs;
+     while (hs)
+     {
+         if ((cp == hs->link.cpMin) || (cp == (hs->link.cpMin + 1)))
+         {
+-            SendMessageW(hwndtext, EM_POSFROMCHAR, &pntl, hs->link.cpMin);
++            SendMessageW(hwndtext, EM_POSFROMCHAR, (WPARAM)&pntl, hs->link.cpMin);
+             if ((x > pntl.x + hs->x) && (x <= pntl.x + hs->x + hs->width) &&
+                 (y > pntl.y + hs->y) && (y <= pntl.y + hs->y + hs->height))
+                 return hs;
+@@ -894,7 +894,7 @@ static LRESULT CALLBACK WINHELP_RicheditWndProc(HWND hWnd, UINT msg,
+             {
+                 IRichEditOle *reole;
+                 ITextDocument2 *doc;
+-                SendMessageW(hWnd, EM_GETOLEINTERFACE, 0, &reole);
++                SendMessageW(hWnd, EM_GETOLEINTERFACE, 0, (LPARAM)&reole);
+                 HRESULT res = reole->lpVtbl->QueryInterface(reole, &IID_ITextDocument2, &doc);
+                 if (SUCCEEDED(res))
+                 {
+@@ -1170,7 +1170,7 @@ BOOL WINHELP_CreateHelpWindow(WINHELP_WNDPAGE* wpage, int nCmdShow, BOOL remembe
+                     ES_MULTILINE | ES_READONLY | WS_CHILD | WS_HSCROLL | WS_VSCROLL | WS_VISIBLE,
+                     0, 0, 0, 0, win->hMainWnd, (HMENU)CTL_ID_TEXT, Globals.hInstance, NULL);
+     /* set ole callback for showing bitmaps */
+-    SendMessageW(hTextWnd, EM_SETOLECALLBACK, NULL, &callback);
++    SendMessageW(hTextWnd, EM_SETOLECALLBACK, 0, (LPARAM)&callback);
+     SendMessageW(hTextWnd, EM_SHOWSCROLLBAR, SB_HORZ, FALSE);
+     SendMessageW(hTextWnd, EM_SETEVENTMASK, 0,
+                     SendMessageW(hTextWnd, EM_GETEVENTMASK, 0, 0) | ENM_MOUSEEVENTS | ENM_LINK);
+@@ -1300,7 +1300,7 @@ static BOOL WINHELP_HandleLink(ENLINK* enlink, WINHELP_WINDOW* win)
+     chars.chrg.cpMin = enlink->chrg.cpMin;
+     chars.chrg.cpMax = enlink->chrg.cpMax;
+     chars.lpstrText = &tmp;
+-    SendMessageW(enlink->nmhdr.hwndFrom, EM_GETTEXTRANGE, 0, &chars);
++    SendMessageW(enlink->nmhdr.hwndFrom, EM_GETTEXTRANGE, 0, (LPARAM)&chars);
+     swscanf(tmp, format, &link);
+ 
+     switch (enlink->msg)
+@@ -1359,7 +1359,7 @@ static BOOL WINHELP_CheckPopup(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
+     case WM_LBUTTONDOWN:
+         if (hWnd == popup->hMainWnd)
+         {
+-            static inloop = FALSE;
++            static BOOL inloop = FALSE;
+             if (inloop)
+                 return FALSE;
+             inloop = TRUE;
+@@ -1595,12 +1595,13 @@ static LRESULT CALLBACK WINHELP_HistoryWndProc(HWND hWnd, UINT msg, WPARAM wPara
+     return DefWindowProcW(hWnd, msg, wParam, lParam);
+ }
+ 
+-static void comp_TTLBTree(void *p, const void *key, int leaf, void **next)
++/* the key is a topic offset (DWORD), not a pointer */
++static int comp_TTLBTree(void *p, const void *key, int leaf, void **next)
+ {
+     *next = (char *)p + 5 + (leaf?strlen((char *)p + 4):1);
+-    if (leaf && (*(DWORD *)*next > key))
++    if (leaf && (*(DWORD *)*next > (DWORD)(DWORD_PTR)key))
+         return 0;
+-    return *(DWORD *)p - (DWORD)key;
++    return *(DWORD *)p - (DWORD)(DWORD_PTR)key;
+ }
+ 
+ static INT_PTR CALLBACK WINHELP_TopicDlgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+@@ -1617,7 +1618,7 @@ static INT_PTR CALLBACK WINHELP_TopicDlgProc(HWND hWnd, UINT msg, WPARAM wParam,
+         for (int i = 0; i < id->count; i++)
+         {
+             DWORD toffset = ((DWORD *)id->offset)[i];
+-            BYTE* ptr = HLPFILE_BPTreeSearch(id->hlpfile->ttlbtree, toffset, comp_TTLBTree) + 4;
++            BYTE* ptr = (BYTE *)HLPFILE_BPTreeSearch(id->hlpfile->ttlbtree, (const void *)(DWORD_PTR)toffset, comp_TTLBTree) + 4;
+             MultiByteToWideChar(id->hlpfile->codepage, 0, ptr, -1, u16str, 100);
+             int idx = SendMessageW(hListWnd, LB_ADDSTRING, 0, (LPARAM)u16str);
+             SendMessageW(hListWnd, LB_SETITEMDATA, idx, (LPARAM)toffset);
+@@ -1656,8 +1657,8 @@ static INT_PTR CALLBACK WINHELP_TopicDlgProc(HWND hWnd, UINT msg, WPARAM wParam,
+  */
+ static void cb_KWBTree(void *p, void **next, void *cookie)
+ {
+-    HWND hListWnd = ((DWORD *)cookie)[0];
+-    WORD cp = ((DWORD *)cookie)[1];
++    HWND hListWnd = (HWND)((DWORD_PTR *)cookie)[0];
++    WORD cp = ((DWORD_PTR *)cookie)[1];
+     int count;
+     WCHAR u16str[100];
+ 
+@@ -1682,9 +1683,9 @@ static INT_PTR CALLBACK WINHELP_IndexDlgProc(HWND hWnd, UINT msg, WPARAM wParam,
+     {
+     case WM_INITDIALOG:
+     {
+-        DWORD data[2];
++        DWORD_PTR data[2];
+         id = (struct index_data*)((PROPSHEETPAGEA*)lParam)->lParam;
+-        data[0] = GetDlgItem(hWnd, IDC_INDEXLIST);
++        data[0] = (DWORD_PTR)GetDlgItem(hWnd, IDC_INDEXLIST);
+         data[1] = id->hlpfile->codepage;
+         HLPFILE_BPTreeEnum(id->hlpfile->xw[0].tree, cb_KWBTree, data);
+         id->jump = FALSE;
+@@ -1719,7 +1720,7 @@ static INT_PTR CALLBACK WINHELP_IndexDlgProc(HWND hWnd, UINT msg, WPARAM wParam,
+                 {
+                     if (id->hlpfile->ttlbtree)
+                     {
+-                        id->offset = DialogBoxParamW(NULL, MAKEINTRESOURCE(IDD_TOPIC), hWnd, WINHELP_TopicDlgProc, id);
++                        id->offset = DialogBoxParamW(NULL, MAKEINTRESOURCE(IDD_TOPIC), hWnd, WINHELP_TopicDlgProc, (LPARAM)id);
+                         if (id->offset == 0xFFFFFFFF)
+                             return TRUE;
+                     }

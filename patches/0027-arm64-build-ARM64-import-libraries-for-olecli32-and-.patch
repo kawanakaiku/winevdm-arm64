@@ -1,0 +1,277 @@
+From 9bc93f8ec86e885555110336c43a98dfec0cce2e Mon Sep 17 00:00:00 2001
+From: u <u@localhost>
+Date: Sat, 7 Nov 2026 12:20:28 +0900
+Subject: [PATCH 27/27] arm64: build ARM64 import libraries for olecli32 and
+ olesvr32 with llvm-dlltool
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ olecli/CMakeLists.txt     |  13 ++-
+ olecli/olecli32_arm64.def | 180 ++++++++++++++++++++++++++++++++++++++
+ olesvr/CMakeLists.txt     |  13 ++-
+ olesvr/olesvr32_arm64.def |  25 ++++++
+ 4 files changed, 229 insertions(+), 2 deletions(-)
+ create mode 100644 olecli/olecli32_arm64.def
+ create mode 100644 olesvr/olesvr32_arm64.def
+
+diff --git a/olecli/CMakeLists.txt b/olecli/CMakeLists.txt
+index 2e01d571..10bba3db 100644
+--- a/olecli/CMakeLists.txt
++++ b/olecli/CMakeLists.txt
+@@ -3,5 +3,16 @@ add_library(olecli SHARED ${SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/olecli.def olecl
+ include_directories(../wine)
+ add_definitions(-D__WINESRC__ -DHAVE_STRNCASECMP -DHAVE__STRNICMP -D_WINTERNL_ -DNtCurrentTeb=NtCurrentTeb__ -DDECLSPEC_HIDDEN= -Dstrncasecmp=_strnicmp)
+ spec_build(olecli.dll16 olecli)
+-target_link_libraries(olecli libwine winecrt0 krnl386 olecli32)
++if (WINEVDM_ARM64 AND NOT(MSVC))
++    # llvm-mingw has no ARM64 import library for olecli32
++    find_program(LLVM_DLLTOOL llvm-dlltool REQUIRED)
++    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libolecli32.a
++        COMMAND ${LLVM_DLLTOOL} -m arm64 -d ${CMAKE_CURRENT_SOURCE_DIR}/olecli32_arm64.def -l ${CMAKE_CURRENT_BINARY_DIR}/libolecli32.a
++        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/olecli32_arm64.def)
++    add_custom_target(olecli32_implib DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/libolecli32.a)
++    add_dependencies(olecli olecli32_implib)
++    target_link_libraries(olecli libwine winecrt0 krnl386 ${CMAKE_CURRENT_BINARY_DIR}/libolecli32.a)
++else()
++    target_link_libraries(olecli libwine winecrt0 krnl386 olecli32)
++endif()
+ set_target_properties(olecli PROPERTIES SUFFIX ".dll16")
+diff --git a/olecli/olecli32_arm64.def b/olecli/olecli32_arm64.def
+new file mode 100644
+index 00000000..7d318eb7
+--- /dev/null
++++ b/olecli/olecli32_arm64.def
+@@ -0,0 +1,180 @@
++LIBRARY olecli32.dll
++EXPORTS
++    BmChangeData
++    BmClone
++    BmCopy
++    BmDraw
++    BmEnumFormat
++    BmEqual
++    BmGetData
++    BmQueryBounds
++    BmRelease
++    BmSaveToStream
++    CheckNetDrive
++    ConnectDlgProc
++    DefCreate
++    DefCreateFromClip
++    DefCreateFromFile
++    DefCreateFromTemplate
++    DefCreateInvisible
++    DefCreateLinkFromClip
++    DefCreateLinkFromFile
++    DefLoadFromStream
++    DibChangeData
++    DibClone
++    DibCopy
++    DibDraw
++    DibEnumFormat
++    DibEqual
++    DibGetData
++    DibQueryBounds
++    DibRelease
++    DibSaveToStream
++    DocWndProc
++    ErrActivate
++    ErrClose
++    ErrCopyFromLink
++    ErrExecute
++    ErrGetUpdateOptions
++    ErrObjectConvert
++    ErrObjectLong
++    ErrQueryOpen
++    ErrQueryOutOfDate
++    ErrQueryProtocol
++    ErrReconnect
++    ErrSetBounds
++    ErrSetData
++    ErrSetHostNames
++    ErrSetTargetDevice
++    ErrSetUpdateOptions
++    ErrShow
++    ErrUpdate
++    GenChangeData
++    GenClone
++    GenCopy
++    GenDraw
++    GenEnumFormat
++    GenEqual
++    GenGetData
++    GenQueryBounds
++    GenRelease
++    GenSaveToStream
++    GenSetData
++    GetTaskVisibleWindow
++    LeActivate
++    LeChangeData
++    LeClone
++    LeClose
++    LeCopy
++    LeCopyFromLink
++    LeCreateInvisible
++    LeDraw
++    LeEnumFormat
++    LeEqual
++    LeExecute
++    LeGetData
++    LeGetUpdateOptions
++    LeObjectConvert
++    LeObjectLong
++    LeQueryBounds
++    LeQueryOpen
++    LeQueryOutOfDate
++    LeQueryProtocol
++    LeQueryType
++    LeReconnect
++    LeRelease
++    LeSaveToStream
++    LeSetBounds
++    LeSetData
++    LeSetHostNames
++    LeSetTargetDevice
++    LeSetUpdateOptions
++    LeShow
++    LeUpdate
++    MfCallbackFunc
++    MfChangeData
++    MfClone
++    MfCopy
++    MfDraw
++    MfEnumFormat
++    MfEqual
++    MfGetData
++    MfQueryBounds
++    MfRelease
++    MfSaveToStream
++    ObjQueryName
++    ObjQuerySize
++    ObjQueryType
++    ObjRename
++    OleActivate
++    OleClone
++    OleClose
++    OleCopyFromLink
++    OleCopyToClipboard
++    OleCreate
++    OleCreateFromClip
++    OleCreateFromFile
++    OleCreateFromTemplate
++    OleCreateInvisible
++    OleCreateLinkFromClip
++    OleCreateLinkFromFile
++    OleDelete
++    OleDraw
++    OleEnumFormats
++    OleEnumObjects
++    OleEqual
++    OleExecute
++    OleGetData
++    OleGetLinkUpdateOptions
++    OleIsDcMeta
++    OleLoadFromStream
++    OleLockServer
++    OleObjectConvert
++    OleQueryBounds
++    OleQueryClientVersion
++    OleQueryCreateFromClip
++    OleQueryLinkFromClip
++    OleQueryName
++    OleQueryOpen
++    OleQueryOutOfDate
++    OleQueryProtocol
++    OleQueryReleaseError
++    OleQueryReleaseMethod
++    OleQueryReleaseStatus
++    OleQuerySize
++    OleQueryType
++    OleReconnect
++    OleRegisterClientDoc
++    OleRelease
++    OleRename
++    OleRenameClientDoc
++    OleRequestData
++    OleRevertClientDoc
++    OleRevokeClientDoc
++    OleSaveToStream
++    OleSavedClientDoc
++    OleSetBounds
++    OleSetColorScheme
++    OleSetData
++    OleSetHostNames
++    OleSetLinkUpdateOptions
++    OleSetTargetDevice
++    OleUnlockServer
++    OleUpdate
++    PbCopyToClipboard
++    PbCreate
++    PbCreateFromClip
++    PbCreateFromFile
++    PbCreateFromTemplate
++    PbCreateInvisible
++    PbCreateLinkFromClip
++    PbCreateLinkFromFile
++    PbDraw
++    PbEnumFormats
++    PbGetData
++    PbLoadFromStream
++    PbQueryBounds
++    SetNetName
++    SetNextNetDrive
++    SrvrWndProc
++    WEP
+diff --git a/olesvr/CMakeLists.txt b/olesvr/CMakeLists.txt
+index 56e2eb0f..a30954bb 100644
+--- a/olesvr/CMakeLists.txt
++++ b/olesvr/CMakeLists.txt
+@@ -3,5 +3,16 @@ add_library(olesvr SHARED ${SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/olesvr.def olesv
+ include_directories(../wine)
+ add_definitions(-D__WINESRC__ -DHAVE_STRNCASECMP -DHAVE__STRNICMP -D_WINTERNL_ -DNtCurrentTeb=NtCurrentTeb__ -DDECLSPEC_HIDDEN= -Dstrncasecmp=_strnicmp)
+ spec_build(olesvr.dll16 olesvr)
+-target_link_libraries(olesvr libwine winecrt0 krnl386 olesvr32)
++if (WINEVDM_ARM64 AND NOT(MSVC))
++    # llvm-mingw has no ARM64 import library for olesvr32
++    find_program(LLVM_DLLTOOL llvm-dlltool REQUIRED)
++    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libolesvr32.a
++        COMMAND ${LLVM_DLLTOOL} -m arm64 -d ${CMAKE_CURRENT_SOURCE_DIR}/olesvr32_arm64.def -l ${CMAKE_CURRENT_BINARY_DIR}/libolesvr32.a
++        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/olesvr32_arm64.def)
++    add_custom_target(olesvr32_implib DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/libolesvr32.a)
++    add_dependencies(olesvr olesvr32_implib)
++    target_link_libraries(olesvr libwine winecrt0 krnl386 ${CMAKE_CURRENT_BINARY_DIR}/libolesvr32.a)
++else()
++    target_link_libraries(olesvr libwine winecrt0 krnl386 olesvr32)
++endif()
+ set_target_properties(olesvr PROPERTIES SUFFIX ".dll16")
+diff --git a/olesvr/olesvr32_arm64.def b/olesvr/olesvr32_arm64.def
+new file mode 100644
+index 00000000..7d7cf905
+--- /dev/null
++++ b/olesvr/olesvr32_arm64.def
+@@ -0,0 +1,25 @@
++LIBRARY olesvr32.dll
++EXPORTS
++    DeleteClientInfo
++    DocWndProc
++    EnumForTerminate
++    FindItemWnd
++    ItemCallBack
++    ItemWndProc
++    OleBlockServer
++    OleQueryServerVersion
++    OleRegisterServer
++    OleRegisterServerDoc
++    OleRenameServerDoc
++    OleRevertServerDoc
++    OleRevokeObject
++    OleRevokeServer
++    OleRevokeServerDoc
++    OleSavedServerDoc
++    OleUnblockServer
++    SendDataMsg
++    SendRenameMsg
++    SrvrWndProc
++    TerminateClients
++    TerminateDocClients
++    WEP

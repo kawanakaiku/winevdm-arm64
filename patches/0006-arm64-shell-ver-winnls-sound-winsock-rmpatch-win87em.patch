@@ -1,0 +1,285 @@
+From 527e55c249bb788635f1de4dd007d47214579f5e Mon Sep 17 00:00:00 2001
+From: u <u@example.com>
+Date: Sat, 7 Nov 2026 10:03:13 +0900
+Subject: [PATCH 06/27] arm64: shell/ver/winnls/sound/winsock/rmpatch/win87em:
+ fix conversions and prototypes
+
+---
+ rmpatch/instr.c   |  4 +++-
+ rmpatch/rmpatch.c |  7 +++++--
+ shell/shell.c     | 21 +++++++++++----------
+ sound/sound.c     |  6 +++---
+ ver/version.c     | 10 +++++-----
+ win87em/win87em.c |  3 +++
+ winnls/winnls.c   |  7 +++----
+ winsock/socket.c  |  6 +++++-
+ 8 files changed, 38 insertions(+), 26 deletions(-)
+
+diff --git a/rmpatch/instr.c b/rmpatch/instr.c
+index 2fdf2e26..e88bdda1 100644
+--- a/rmpatch/instr.c
++++ b/rmpatch/instr.c
+@@ -32,6 +32,8 @@
+ #define SET_LOBYTE(dw,val)  ((dw) = ((dw) & 0xffffff00) | LOBYTE(val))
+ #define ADD_LOWORD(dw,val)  ((dw) = ((dw) & 0xffff0000) | LOWORD((DWORD)(dw)+(val)))
+ 
++/* ARM64: declared in krnl386 (dosexe.h is not included here); needs a prototype */
++__declspec(dllimport) void DOSVM_start_bios_timer(void);
+ static WORD dosmem_0040H = 0; 
+ static WORD dosmem_0000H = 0;
+ 
+@@ -608,7 +610,7 @@ BOOL rmpatch_emulate_instruction(CONTEXT86 *context)
+                 // this is a standard pattern for MSC _int86
+                 if (*(WORD *)(addr + 2) != context->SegSs)
+                     break;
+-                static WORD stackcode = NULL;
++                static WORD stackcode = 0;
+                 if (!stackcode)
+                     stackcode = AllocDStoCSAlias16(context->SegSs);
+                 *(WORD *)(addr + 2) = stackcode;
+diff --git a/rmpatch/rmpatch.c b/rmpatch/rmpatch.c
+index eae67108..52416a23 100644
+--- a/rmpatch/rmpatch.c
++++ b/rmpatch/rmpatch.c
+@@ -101,6 +101,9 @@ struct stkframe
+ };
+ #include <poppack.h>
+ 
++BOOL rmpatch_emulate_instruction(CONTEXT86 *context);
++static HINSTANCE16 hToolhelp16;
++
+ void WINAPI intcb(CONTEXT86 *context)
+ {
+ 	struct stkframe *frame = MapSL(MAKESEGPTR(context->SegSs, context->Esp));
+@@ -124,14 +127,14 @@ BOOL WINAPI DllEntryPoint(DWORD fdwReason, HINSTANCE16 hinstDLL, WORD ds,
+ 	switch(fdwReason)
+ 	{
+ 	case DLL_PROCESS_ATTACH:
+-		LoadLibrary16("TOOLHELP");
++		hToolhelp16 = LoadLibrary16("TOOLHELP");
+ 		InterruptRegister16(FAKE_HTASK16, GetProcAddress16(GetModuleHandle16("RMPATCH"), "intcb"));
+ 		NotifyRegister16(FAKE_HTASK16, GetProcAddress16(GetModuleHandle16("RMPATCH"), "checkpatch"), 0 /*NF_NORMAL*/);
+ 		break;
+ 	case DLL_PROCESS_DETACH:
+ 		InterruptUnRegister16(FAKE_HTASK16);
+ 		NotifyUnRegister16(FAKE_HTASK16);
+-		FreeLibrary16("TOOLHELP");
++		FreeLibrary16(hToolhelp16);
+ 		break;
+ 	}
+ 	return TRUE;
+diff --git a/shell/shell.c b/shell/shell.c
+index 80b61931..27f08a7a 100644
+--- a/shell/shell.c
++++ b/shell/shell.c
+@@ -263,7 +263,8 @@ BOOL16 WINAPI ShellAbout16( HWND16 hWnd, LPCSTR szApp, LPCSTR szOtherStuff, HICO
+ }
+ 
+ 
+-__declspec(dllimport) HICON NE_ExtractIcon(LPCSTR lpszExeFileName,
++/* ARM64: actually returns a count/UINT (see krnl386/resource.c) */
++__declspec(dllimport) UINT NE_ExtractIcon(LPCSTR lpszExeFileName,
+ 	HICON * RetPtr,
+ 	INT nIconIndex,
+ 	UINT nIcons,
+@@ -281,7 +282,7 @@ static inline UINT PrivateExtractIconsNE(
+ 	UINT nIcons,    /* [in] number of icons to retrieve */
+ 	UINT flags)    /* [in] LR_* flags used by LoadImage */
+ {
+-	HICON ret;
++	UINT ret;
+ 	return (ret = PrivateExtractIconsA(lpwstrFile, nIndex, sizeX, sizeY, phicon, pIconId, nIcons, flags))
+ 		? ret : NE_ExtractIcon(lpwstrFile, phicon, nIndex, nIcons, sizeX, sizeY, pIconId, flags);
+ }
+@@ -374,7 +375,7 @@ HICON16 WINAPI ExtractIcon16( HINSTANCE16 hInstance, LPCSTR lpszExeFileName,
+     lpszExeFileName = RedirectSystemDir(lpszExeFileName, buf, MAX_PATH);
+     if (nIconIndex == 0xFFFF)
+     {
+-	    return ExtractIconNE(NULL, lpszExeFileName, -1);
++	    return (HICON16)(ULONG_PTR)ExtractIconNE(NULL, lpszExeFileName, -1);
+     }
+     return convert_icon_to_16( hInstance, ExtractIconNE(NULL, lpszExeFileName, nIconIndex) );
+ }
+@@ -417,21 +418,21 @@ UINT16 WINAPI ExtractIconEx16(
+ * Return icon for given file (either from file itself or from associated
+ * executable) and patch parameters if needed.
+ */
+-HICON16 WINAPI ExtractAssociatedIconNE(HINSTANCE hInst, LPSTR lpIconPath, LPWORD lpiIcon)
++HICON16 WINAPI ExtractAssociatedIconNE(HINSTANCE16 hInst, LPSTR lpIconPath, LPWORD lpiIcon)
+ {
+-	HICON hIcon = NULL;
++	HICON16 hIcon = 0;
+ 	WORD wDummyIcon = 0;
+ 
+-	TRACE("%p %s %p\n", hInst, debugstr_a(lpIconPath), lpiIcon);
++	TRACE("%04x %s %p\n", hInst, debugstr_a(lpIconPath), lpiIcon);
+ 
+ 	if (lpiIcon == NULL)
+ 		lpiIcon = &wDummyIcon;
+ 
+ 	hIcon = ExtractIcon16(hInst, lpIconPath, *lpiIcon);
+ 
+-	if (hIcon < (HICON)2)
++	if (hIcon < 2)
+ 	{
+-		return convert_icon_to_16(hInst, ExtractAssociatedIconA(hInst, lpIconPath, lpiIcon));
++		return convert_icon_to_16(hInst, ExtractAssociatedIconA(NULL /* hInst was always NULL */, lpIconPath, lpiIcon));
+ 	}
+ 	return hIcon;
+ }
+@@ -443,7 +444,7 @@ HICON16 WINAPI ExtractAssociatedIconNE(HINSTANCE hInst, LPSTR lpIconPath, LPWORD
+  */
+ HICON16 WINAPI ExtractAssociatedIcon16(HINSTANCE16 hInst, LPSTR lpIconPath, LPWORD lpiIcon)
+ {
+-    return ExtractAssociatedIconNE(NULL, lpIconPath, lpiIcon);
++    return ExtractAssociatedIconNE(0, lpIconPath, lpiIcon);
+ }
+ 
+ /*************************************************************************
+@@ -730,7 +731,7 @@ HINSTANCE16 WINAPI ShellExecute16( HWND16 hWnd, LPCSTR lpOperation,
+     }
+     if (rret1632 == ERROR_FILE_NOT_FOUND)
+     {
+-        return rret1632;
++        return (HINSTANCE16)(ULONG_PTR)rret1632;
+     }
+ 	HINSTANCE rret = ShellExecuteA(HWND_32(hWnd), lpOperation, lpFile, lpParameters,
+ 		lpDirectory, iShowCmd);
+diff --git a/sound/sound.c b/sound/sound.c
+index 47d47786..5b50e523 100644
+--- a/sound/sound.c
++++ b/sound/sound.c
+@@ -52,7 +52,7 @@ typedef struct {
+ 
+ static NOTE *queue;
+ static int queuelen;
+-static HTASK owner = 0;
++static HTASK16 owner = 0;
+ static volatile BOOL playing;
+ static int nextnote;
+ static HANDLE thread;
+@@ -76,7 +76,7 @@ INT16 WINAPI OpenSound16(void)
+   const WAVEFORMATEX wfmt = { WAVE_FORMAT_PCM, 1, 48000, 48000, 1, 8, 0 };
+   event = CreateEventA(NULL, FALSE, FALSE, NULL);
+ 
+-  if (waveOutOpen(&wohand, WAVE_MAPPER, &wfmt, event, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR)
++  if (waveOutOpen(&wohand, WAVE_MAPPER, &wfmt, (DWORD_PTR)event, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR)
+   {
+       CloseHandle(event);
+       return S_SERDVNA;
+@@ -253,7 +253,7 @@ static DWORD WINAPI play(LPVOID param)
+     k += interslen;
+   }
+ 
+-  WAVEHDR whdr = { wavbuf, buflen, 0, 0, 0, 0, NULL, NULL };
++  WAVEHDR whdr = { wavbuf, buflen, 0, 0, 0, 0, NULL, 0 };
+   if (waveOutPrepareHeader(wohand, &whdr, sizeof(whdr)) == MMSYSERR_NOERROR)
+   {
+       if (waveOutWrite(wohand, &whdr, sizeof(whdr)) == MMSYSERR_NOERROR)
+diff --git a/ver/version.c b/ver/version.c
+index 7d1867a7..4f7bcdb6 100644
+--- a/ver/version.c
++++ b/ver/version.c
+@@ -537,14 +537,14 @@ DWORD WINAPI GetFileVersionInfoSize16( LPCSTR lpszFileName, LPDWORD lpdwHandle )
+ {
+     BOOL ret;
+     TRACE("(%s, %p)\n", debugstr_a(lpszFileName), lpdwHandle );
+-    ret = GetFileResourceSize16( lpszFileName, VS_FILE_INFO, VS_VERSION_INFO, lpdwHandle );
++    ret = GetFileResourceSize16( lpszFileName, VS_FILE_INFO, MAKEINTRESOURCEA(VS_VERSION_INFO), lpdwHandle );
+     if (!ret)
+     {
+         char path[MAX_PATH];
+         if (findfile( lpszFileName, path, MAX_PATH ))
+-            ret = GetFileResourceSize16( lpszFileName, VS_FILE_INFO, VS_VERSION_INFO, lpdwHandle );
++            ret = GetFileResourceSize16( lpszFileName, VS_FILE_INFO, MAKEINTRESOURCEA(VS_VERSION_INFO), lpdwHandle );
+     }
+-    if (!ret) *lpdwHandle = NULL;
++    if (!ret) *lpdwHandle = 0;
+     return ret;
+ }
+ 
+@@ -558,12 +558,12 @@ DWORD WINAPI GetFileVersionInfo16( LPCSTR lpszFileName, DWORD handle,
+     char *buf;
+     TRACE("(%s, %08x, %d, %p)\n",
+                 debugstr_a(lpszFileName), handle, cbBuf, lpvData );
+-    ret = GetFileResource16( lpszFileName, VS_FILE_INFO, VS_VERSION_INFO, NULL, cbBuf, lpvData );
++    ret = GetFileResource16( lpszFileName, VS_FILE_INFO, MAKEINTRESOURCEA(VS_VERSION_INFO), 0, cbBuf, lpvData );
+     if (!ret)
+     {
+         char path[MAX_PATH];
+         if (findfile( lpszFileName, path, MAX_PATH ))
+-            ret = GetFileResource16( lpszFileName, VS_FILE_INFO, VS_VERSION_INFO, NULL, cbBuf, lpvData );
++            ret = GetFileResource16( lpszFileName, VS_FILE_INFO, MAKEINTRESOURCEA(VS_VERSION_INFO), 0, cbBuf, lpvData );
+     }
+     return ret;
+ }
+diff --git a/win87em/win87em.c b/win87em/win87em.c
+index ce24e2b8..3cae3669 100644
+--- a/win87em/win87em.c
++++ b/win87em/win87em.c
+@@ -23,6 +23,9 @@
+ #include "wine/debug.h"
+ #include "wownt32.h"
+ #include "../krnl386/dosexe.h"
++
++/* ARM64: exported from krnl386.def but not declared in any header */
++__declspec(dllimport) INTPROC DOSVM_SetBuiltinVector(BYTE intnum, INTPROC handler);
+ /*
+ #define __asm__(xxx)
+ #define __asm__
+diff --git a/winnls/winnls.c b/winnls/winnls.c
+index 5c767aed..09323861 100644
+--- a/winnls/winnls.c
++++ b/winnls/winnls.c
+@@ -26,8 +26,7 @@
+ #include "wownt32.h"
+ #include "wine/winuser16.h"
+ 
+-WINE_DEFAULT_DEBUG_CHANNEL(winnls);
+-WINE_DECLARE_DEBUG_CHANNEL(winnls);
++/* ARM64: the upstream WINE_*_DEBUG_CHANNEL(winnls) lines here were no-ops (macros undefined, parsed by MSVC as prototypes); the real channel is defined below */
+ //BOOL WINAPI WINNLS32EnableIME(HWND hWnd, BOOL fEnable);
+ //BOOL WINAPI WINNLS32GetEnableStatus(HWND hWnd);
+ 
+@@ -178,7 +177,7 @@ static void logfont_16_to_A(const LOGFONT16 *font16, LPLOGFONTA font32)
+     font32->lfCharSet = font16->lfCharSet;
+     font32->lfOutPrecision = font16->lfOutPrecision;
+     font32->lfClipPrecision = font16->lfClipPrecision;
+-    font32->lfQuality = font16;
++    font32->lfQuality = font16->lfQuality;
+     font32->lfPitchAndFamily = font16->lfPitchAndFamily;
+     memcpy(font32->lfFaceName, font16->lfFaceName, LF_FACESIZE);
+     font32->lfFaceName[LF_FACESIZE - 1] = 0;
+@@ -278,7 +277,7 @@ LRESULT WINAPI SendIMEMessageEx16(
+                 }
+             }
+         }
+-        lpime32->lParam1 = lplogfont;
++        lpime32->lParam1 = (LPARAM)lplogfont;
+         HIMC himc = ImmGetContext(hwnd32);
+         //IME_SETCONVERSIONFONTEX doesnt work well
+         ImmSetCompositionFontA(himc, lplogfont);
+diff --git a/winsock/socket.c b/winsock/socket.c
+index 3ece26b3..d07b5207 100644
+--- a/winsock/socket.c
++++ b/winsock/socket.c
+@@ -912,6 +912,10 @@ INT16 WINAPI default_hook()
+     return win32_hook();
+ }
+ 
++/* ARM64: exported by krnl386.def, no prototype in a public header */
++__declspec(dllimport) PVOID getWOW32Reserved(void);
++__declspec(dllimport) PVOID setWOW32Reserved(PVOID);
++
+ DWORD WINAPI thunk_hook()
+ {
+     PVOID sssp = getWOW32Reserved();
+@@ -926,7 +930,7 @@ DWORD WINAPI thunk_hook()
+  */
+ FARPROC16 WINAPI WSASetBlockingHook16(FARPROC16 lpBlockFunc)
+ {
+-    static FARPROC16 default_hook = NULL;
++    static FARPROC16 default_hook = 0;
+     if (!default_hook)
+         default_hook = GetProcAddress16(GetModuleHandle16("WINSOCK"), "DEFAULT_HOOK");
+     if (!win32_hook)

@@ -1,0 +1,8 @@
+out/
+out-*/
+winevdm/
+wt-*/
+# 手元だけの道具 (実機の試験・一度だけの書き換え・作業者への依頼)
+device/
+scripts/
+docs/
