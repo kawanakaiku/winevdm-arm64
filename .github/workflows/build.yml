@@ -35,7 +35,7 @@ jobs:
           git init -q winevdm
           git -C winevdm fetch -q --depth 1 https://github.com/otya128/winevdm.git "$WINEVDM_COMMIT"
           git -C winevdm checkout -q FETCH_HEAD
-          git -C winevdm -c user.name=ci -c user.email=ci@localhost am -q --keep-cr ../patches/*.patch
+          git -C winevdm -c user.name=ci -c user.email=ci@localhost am -q --keep-cr "$PWD"/patches/*.patch
 
       - name: Build
         run: ./build.sh

@@ -42,7 +42,7 @@ GitHub Actions (`.github/workflows/build.yml`) は次の手順で動きます。
 ```sh
 git clone https://github.com/otya128/winevdm.git winevdm
 git -C winevdm checkout b88d7f8736d77baa5710eb0c35f81b489540c1a0
-git -C winevdm am --keep-cr ../patches/*.patch
+git -C winevdm am --keep-cr "$PWD"/patches/*.patch
 ./build.sh                 # 手元の道具 (convspec・widl) → CMake → ninja。出力は out/build
 ./package.sh otvdm-arm64   # out/otvdm-arm64.zip
 ```
